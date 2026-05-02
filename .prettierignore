@@ -1,0 +1,8 @@
+archive/
+dist/
+node_modules/
+src-tauri/gen/
+src-tauri/target/
+*.tsbuildinfo
+pnpm-lock.yaml
+Cargo.lock

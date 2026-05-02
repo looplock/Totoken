@@ -1,0 +1,54 @@
+.app-icon {
+  --app-icon-color: var(--color-text-primary);
+  --kiro-icon-bg: #000000;
+  --kiro-icon-body: #ffffff;
+  --kiro-icon-eyes: #000000;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+  color: var(--app-icon-color);
+  overflow: hidden;
+}
+
+.app-icon-svg {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.app-icon-svg > svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.app-icon[data-app='opencode'] .app-icon-svg > svg {
+  width: 13px;
+  height: 18px;
+}
+
+.app-icon[data-app='generic'] {
+  --app-icon-color: var(--color-text-muted);
+}
+
+:root[data-theme-mode='dark'] .app-icon {
+  --app-icon-color: #dbe8ff;
+}
+
+:root[data-theme-mode='dark'] .app-icon[data-app='opencode'] {
+  --app-icon-color: #d7e4f8;
+}
+
+:root[data-theme-mode='dark'] .app-icon[data-app='kiro'] {
+  --kiro-icon-bg: #eaf2ff;
+  --kiro-icon-body: #172033;
+  --kiro-icon-eyes: #eaf2ff;
+}

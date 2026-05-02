@@ -1,0 +1,49 @@
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  vertical-align: middle;
+  border: 1px solid transparent;
+}
+
+.status-dot-success.status-dot-filled {
+  background: var(--color-success);
+}
+
+.status-dot-success.status-dot-hollow {
+  border-color: var(--color-success);
+}
+
+.status-dot-warning.status-dot-filled {
+  background: var(--color-warning);
+}
+
+.status-dot-warning.status-dot-hollow {
+  border-color: var(--color-warning);
+}
+
+.status-dot-danger.status-dot-filled {
+  background: var(--color-danger);
+}
+
+.status-dot-danger.status-dot-hollow {
+  border-color: var(--color-danger);
+}
+
+.status-dot-info.status-dot-filled {
+  background: var(--color-accent);
+}
+
+.status-dot-info.status-dot-hollow {
+  border-color: var(--color-accent);
+}
+
+.status-dot-muted.status-dot-filled {
+  background: var(--color-icon-muted);
+}
+
+.status-dot-muted.status-dot-hollow {
+  border-color: var(--color-icon-muted);
+}

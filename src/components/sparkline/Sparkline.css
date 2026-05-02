@@ -1,0 +1,62 @@
+.sparkline {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+.sparkline svg {
+  display: block;
+  overflow: visible;
+}
+
+.sparkline-stroke {
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sparkline-fill {
+  fill: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  stroke: none;
+}
+
+.sparkline[data-tone='success'] .sparkline-stroke {
+  stroke: var(--color-success);
+}
+
+.sparkline[data-tone='success'] .sparkline-fill {
+  fill: color-mix(in srgb, var(--color-success) 18%, transparent);
+}
+
+.sparkline[data-tone='danger'] .sparkline-stroke {
+  stroke: var(--color-danger);
+}
+
+.sparkline[data-tone='danger'] .sparkline-fill {
+  fill: color-mix(in srgb, var(--color-danger) 18%, transparent);
+}
+
+.sparkline[data-tone='warning'] .sparkline-stroke {
+  stroke: var(--color-warning);
+}
+
+.sparkline[data-tone='warning'] .sparkline-fill {
+  fill: color-mix(in srgb, var(--color-warning) 18%, transparent);
+}
+
+.sparkline[data-tone='muted'] .sparkline-stroke {
+  stroke: var(--color-icon-muted);
+}
+
+.sparkline[data-tone='muted'] .sparkline-fill {
+  fill: color-mix(in srgb, var(--color-icon-muted) 14%, transparent);
+}
+
+.sparkline-empty {
+  display: inline-block;
+  height: 1px;
+  background: var(--color-border);
+  border-radius: 999px;
+}
