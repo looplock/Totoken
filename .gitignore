@@ -25,6 +25,7 @@ vite.config.js
 vite.config.d.ts
 
 .claude/
+AGENTS.md
 .env
 .env.*
 !.env.example
