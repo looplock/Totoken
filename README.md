@@ -1,7 +1,6 @@
 <div align="center">
   <h1>Totoken</h1>
-  <p><strong>Local AI coding tool usage inspector</strong></p>
-  <p>Inspect sessions, tokens, models, scans, and statistics from supported desktop AI coding tools.</p>
+  <p><strong>Inspect local AI coding activity, token usage, and estimated costs across desktop AI coding tools.</strong></p>
   <p>
     <a href="README.zh-CN.md">简体中文</a>
   </p>
@@ -21,11 +20,21 @@ Totoken is a desktop application for inspecting local AI coding tool activity. I
 
 The project currently focuses on local usage visibility. It does not run a model gateway, proxy provider traffic, or manage external API credentials.
 
+## Download
+
+Download the latest desktop installers from the [Releases](https://github.com/looplock/Totoken/releases) page.
+
+- Windows x64: MSI
+- macOS Intel / Apple Silicon: DMG
+- Linux x64: DEB or AppImage
+
+Totoken is a local desktop app. End users do not need Node.js, pnpm, Rust, or the Tauri toolchain.
+
 ## Screenshots
 
-![Source management](docs/assets/sources.png)
-
 ![Statistics](docs/assets/statistic.png)
+
+![Source management](docs/assets/sources.png)
 
 ## Features
 
@@ -44,6 +53,12 @@ The project currently focuses on local usage visibility. It does not run a model
 Totoken uses OpenRouter's Models API as a third-party source for model metadata such as model names, context windows, capabilities, supported parameters, and pricing. The catalog is used for display and local cost estimation only.
 
 Totoken is not affiliated with, sponsored by, or endorsed by OpenRouter. Model metadata and pricing can change over time, so estimates should be treated as informational rather than billing records.
+
+## Privacy & Data
+
+Totoken reads local history files from supported AI coding tools and stores normalized data locally under `~/.totoken/`.
+
+It does not upload your sessions, messages, prompts, code, or API credentials. Network access is used only when you choose to sync model catalog metadata from OpenRouter for display and local cost estimation.
 
 ## Tech Stack
 
@@ -193,6 +208,10 @@ scripts/              Local project checks
 docs/                 Local design notes
 archive/              Ignored staging area for removed features
 ```
+
+## Contributing
+
+Bug reports, pull requests, and local check instructions are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

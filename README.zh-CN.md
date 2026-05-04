@@ -1,7 +1,6 @@
 <div align="center">
   <h1>Totoken</h1>
-  <p><strong>本地 AI 编程工具用量查看器</strong></p>
-  <p>查看已支持桌面 AI 编程工具的会话、Token、模型、扫描记录和统计数据。</p>
+  <p><strong>查看本地 AI 编程工具的会话、Token 用量和费用估算。</strong></p>
   <p>
     <a href="README.md">English</a>
   </p>
@@ -21,11 +20,21 @@ Totoken 是一个用于查看本地 AI 编程工具活动的桌面应用。它�
 
 当前项目聚焦本地用量可视化，不提供模型网关、不代理供应商流量，也不管理外部 API 凭据。
 
+## 下载
+
+请从 [Releases](https://github.com/looplock/Totoken/releases) 页面下载最新桌面安装包。
+
+- Windows x64：MSI
+- macOS Intel / Apple Silicon：DMG
+- Linux x64：DEB 或 AppImage
+
+Totoken 是本地桌面应用。普通用户不需要安装 Node.js、pnpm、Rust 或 Tauri 工具链。
+
 ## 界面预览
 
-![来源管理](docs/assets/sources-zh.png)
-
 ![统计页面](docs/assets/statistics-zh.png)
+
+![来源管理](docs/assets/sources-zh.png)
 
 ## 功能
 
@@ -44,6 +53,12 @@ Totoken 是一个用于查看本地 AI 编程工具活动的桌面应用。它�
 Totoken 使用 OpenRouter 的 Models API 作为第三方模型元数据来源，用于获取模型名称、上下文窗口、能力、支持参数和价格等信息。模型目录仅用于展示和本地费用估算。
 
 Totoken 与 OpenRouter 没有关联、赞助或背书关系。模型元数据和价格可能随时间变化，因此费用估算只应作为参考信息，不应视为账单记录。
+
+## 隐私与数据
+
+Totoken 会读取已支持 AI 编程工具的本地历史文件，并将标准化后的数据存储在本机 `~/.totoken/` 下。
+
+它不会上传你的会话、消息、提示词、代码或 API 凭据。仅当你选择同步模型目录时，才会访问 OpenRouter 以获取模型元数据，用于展示和本地费用估算。
 
 ## 技术栈
 
@@ -193,6 +208,10 @@ scripts/                  本地项目检查脚本
 docs/                     本地设计文档
 archive/                  被移除功能的忽略暂存目录
 ```
+
+## 贡献
+
+Bug 反馈、Pull Request 提交流程和本地检查命令见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 
