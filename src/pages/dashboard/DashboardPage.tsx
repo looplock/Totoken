@@ -322,10 +322,7 @@ function TrendRow({
           <div>
             <div className="dashboard-card-title-wrap">
               <h2 className="dashboard-card-title">{t('dashboard.trend.title')}</h2>
-              <InfoTooltip
-                label={t('dashboard.info.show')}
-                content={t('dashboard.info.trend')}
-              />
+              <InfoTooltip label={t('dashboard.info.show')} content={t('dashboard.info.trend')} />
             </div>
             <p className="dashboard-card-subtitle">{t('dashboard.trend.subtitle')}</p>
           </div>

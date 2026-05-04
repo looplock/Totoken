@@ -347,7 +347,8 @@ export const zhMessages = {
   'dashboard.trend.legendOutput': '输出',
   'dashboard.trend.legendCost': '预估成本',
   'dashboard.info.show': '查看说明',
-  'dashboard.info.trend': '按小时展示今日 Token、输入、输出与预估成本变化，用于快速判断当前使用峰值和趋势。',
+  'dashboard.info.trend':
+    '按小时展示今日 Token、输入、输出与预估成本变化，用于快速判断当前使用峰值和趋势。',
   'dashboard.info.topModels': '展示今日 Token 使用量最高的模型，占比按今日总 Token 计算。',
   'dashboard.info.topApps': '展示今日 Token 使用量最高的来源应用，占比按今日总 Token 计算。',
   'dashboard.topModels.title': 'Top 模型',

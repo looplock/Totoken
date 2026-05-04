@@ -360,9 +360,12 @@ export const enMessages = {
   'dashboard.trend.legendOutput': 'Output',
   'dashboard.trend.legendCost': 'Cost',
   'dashboard.info.show': 'Show section info',
-  'dashboard.info.trend': 'Shows today’s hourly token, input, output, and estimated cost movement so usage peaks and direction are easy to scan.',
-  'dashboard.info.topModels': 'Shows the models with the highest token usage today. Percentages are calculated against total tokens for today.',
-  'dashboard.info.topApps': 'Shows the source apps with the highest token usage today. Percentages are calculated against total tokens for today.',
+  'dashboard.info.trend':
+    'Shows today’s hourly token, input, output, and estimated cost movement so usage peaks and direction are easy to scan.',
+  'dashboard.info.topModels':
+    'Shows the models with the highest token usage today. Percentages are calculated against total tokens for today.',
+  'dashboard.info.topApps':
+    'Shows the source apps with the highest token usage today. Percentages are calculated against total tokens for today.',
   'dashboard.topModels.title': 'Top models',
   'dashboard.topModels.subtitle': 'by token share',
   'dashboard.topApps.title': 'Top apps',
