@@ -58,7 +58,6 @@ export async function loadDashboard(): Promise<DashboardViewModel> {
     trendToday,
     topModels,
     topApps,
-    loadedAt: new Date().toISOString(),
     partialFailures,
   };
 }
@@ -91,22 +90,59 @@ function buildKpi(statistics: StatisticsOverview | null): DashboardKpi {
     ? {
         value: statistics.summary.totalTokens.value,
         deltaPercent: normalizeDelta(statistics.summary.totalTokens.deltaPercent),
+        sparkline: statistics.trend.total,
       }
-    : { value: 0, deltaPercent: null };
+    : { value: 0, deltaPercent: null, sparkline: [] };
+
+  const todaySessions: DashboardKpiDelta = statistics
+    ? {
+        value: statistics.summary.totalSessions.value,
+        deltaPercent: normalizeDelta(statistics.summary.totalSessions.deltaPercent),
+        sparkline: buildSessionSparkline(statistics),
+      }
+    : { value: 0, deltaPercent: null, sparkline: [] };
 
   const todayCostValue = statistics ? sum(statistics.trend.costUsd) : 0;
   const todayCostUsd: DashboardKpiCostDelta = {
     valueUsd: todayCostValue,
-    deltaPercent: null,
+    deltaPercent: statistics ? computeSparklineDeltaPercent(statistics.trend.costUsd) : null,
+    sparkline: statistics?.trend.costUsd ?? [],
   };
 
-  return { todayTokens, todayCostUsd };
+  return { todayTokens, todaySessions, todayCostUsd };
 }
 
 function normalizeDelta(value: number | null | undefined): number | null {
   if (value === null || value === undefined) return null;
   if (!Number.isFinite(value)) return null;
   return value;
+}
+
+function buildSessionSparkline(statistics: StatisticsOverview): number[] {
+  const matrix = statistics.activity.sessions.matrix;
+  return statistics.trend.bucketStarts.map((bucketStart) => {
+    const date = new Date(bucketStart);
+    const dayIndex = (date.getDay() + 6) % 7;
+    const hourIndex = date.getHours();
+    return matrix[dayIndex]?.[hourIndex] ?? 0;
+  });
+}
+
+function computeSparklineDeltaPercent(values: number[]): number | null {
+  const finiteValues = values.filter((value) => Number.isFinite(value));
+  if (finiteValues.length === 0) {
+    return null;
+  }
+
+  const midpoint = Math.max(1, Math.floor(finiteValues.length / 2));
+  const previous = sum(finiteValues.slice(0, midpoint));
+  const current = sum(finiteValues.slice(midpoint));
+
+  if (previous <= 0) {
+    return current > 0 ? 100 : 0;
+  }
+
+  return ((current - previous) / previous) * 100;
 }
 
 function buildTrend(statistics: StatisticsOverview): DashboardTrendPoint[] {
@@ -133,28 +169,32 @@ function buildTrend(statistics: StatisticsOverview): DashboardTrendPoint[] {
 
 function buildTopModels(detailRows: StatisticsDetailRow[]): DashboardTopRow[] {
   const tally = new Map<string, number>();
+  let total = 0;
   for (const row of detailRows) {
     const key = row.model || '(unknown)';
     const tokens = (row.inputTokens ?? 0) + (row.outputTokens ?? 0);
+    total += tokens;
     tally.set(key, (tally.get(key) ?? 0) + tokens);
   }
-  return finishTop(tally);
+  return finishTop(tally, total);
 }
 
 function buildTopApps(distribution: StatisticsDistributionRow[]): DashboardTopRow[] {
   const tally = new Map<string, number>();
+  let total = 0;
   for (const row of distribution) {
-    tally.set(row.app, (tally.get(row.app) ?? 0) + (row.totalTokens ?? 0));
+    const tokens = row.totalTokens ?? 0;
+    total += tokens;
+    tally.set(row.app, (tally.get(row.app) ?? 0) + tokens);
   }
-  return finishTop(tally);
+  return finishTop(tally, total);
 }
 
-function finishTop(tally: Map<string, number>): DashboardTopRow[] {
+function finishTop(tally: Map<string, number>, total: number): DashboardTopRow[] {
   const entries = Array.from(tally.entries())
     .filter(([, value]) => value > 0)
     .sort((a, b) => b[1] - a[1])
     .slice(0, TOP_N);
-  const total = entries.reduce((acc, [, value]) => acc + value, 0);
   if (total <= 0) return [];
   return entries.map(([label, value]) => ({
     label,

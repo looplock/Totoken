@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { BarChart3, RefreshCw, Workflow } from 'lucide-react';
+import { BarChart3, FolderKanban, RefreshCw, Workflow } from 'lucide-react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { AppIcon } from '../../components/app-icon/AppIcon';
 import { EmptyState } from '../../components/empty-state/EmptyState';
-import { StatusDot, type StatusTone } from '../../components/status/StatusDot';
+import type { StatusTone } from '../../components/status/StatusDot';
+import { InfoTooltip } from '../../components/tooltip/InfoTooltip';
 import { useI18n } from '../../i18n/useI18n';
 import { sourceApps, type SourceApp } from '../../lib/sourceApps';
 import { isTauriRuntime } from '../../lib/tauri';
@@ -50,8 +51,12 @@ export function DashboardPage() {
   const [loadError, setLoadError] = useState('');
   const [now, setNow] = useState(() => Date.now());
   const loadRef = useRef<() => Promise<void>>();
+  const loadRequestIdRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = loadRequestIdRef.current + 1;
+    loadRequestIdRef.current = requestId;
+
     if (!runtimeAvailable) {
       setInitialLoading(false);
       setLoadError(t('dashboard.feedback.runtimeRequired'));
@@ -61,13 +66,21 @@ export function DashboardPage() {
     setRefreshing(true);
     try {
       const next = await loadDashboard();
+      if (loadRequestIdRef.current !== requestId) {
+        return;
+      }
       setModel(next);
       setLoadError('');
     } catch (error) {
+      if (loadRequestIdRef.current !== requestId) {
+        return;
+      }
       setLoadError(error instanceof Error ? error.message : t('dashboard.feedback.loadFailed'));
     } finally {
-      setInitialLoading(false);
-      setRefreshing(false);
+      if (loadRequestIdRef.current === requestId) {
+        setInitialLoading(false);
+        setRefreshing(false);
+      }
     }
   }, [runtimeAvailable, t]);
 
@@ -152,7 +165,7 @@ export function DashboardPage() {
       ) : null}
 
       {initialLoading && !model ? (
-        <DashboardSkeleton />
+        <EmptyState>{t('dashboard.feedback.loading')}</EmptyState>
       ) : model ? (
         <>
           <KpiRow model={model} t={t} locale={locale} tokenUnitLocale={tokenUnitLocale} now={now} />
@@ -166,6 +179,10 @@ export function DashboardPage() {
 function StatusActionButtons({ t }: { t: ReturnType<typeof useI18n>['t'] }) {
   return (
     <>
+      <Link className="dashboard-btn" to="/sessions">
+        <FolderKanban size={16} />
+        <span>{t('dashboard.action.openSessions')}</span>
+      </Link>
       <Link className="dashboard-btn" to="/management/scan-records">
         <Workflow size={16} />
         <span>{t('nav.scanRecords')}</span>
@@ -199,7 +216,6 @@ function KpiRow({
         >
           <header className="dashboard-status-summary-head">
             <span>{item.label}</span>
-            <StatusDot tone={item.tone} />
           </header>
           <strong className="dashboard-status-summary-value">{item.cardValue}</strong>
           {item.detail ? (
@@ -212,17 +228,23 @@ function KpiRow({
         value={statisticsFailed ? '-' : formatTokens(model.kpi.todayTokens, tokenUnitLocale)}
         secondary={statisticsFailed ? t('dashboard.feedback.sectionFailed') : undefined}
         deltaPercent={statisticsFailed ? null : model.kpi.todayTokens.deltaPercent}
+        sparkline={statisticsFailed ? [] : model.kpi.todayTokens.sparkline}
+        tone="default"
+      />
+      <KpiCard
+        label={t('dashboard.kpi.todaySessions')}
+        value={statisticsFailed ? '-' : formatCount(model.kpi.todaySessions.value, locale)}
+        secondary={statisticsFailed ? t('dashboard.feedback.sectionFailed') : undefined}
+        deltaPercent={statisticsFailed ? null : model.kpi.todaySessions.deltaPercent}
+        sparkline={statisticsFailed ? [] : model.kpi.todaySessions.sparkline}
         tone="default"
       />
       <KpiCard
         label={t('dashboard.kpi.todayCost')}
         value={statisticsFailed ? '-' : formatCost(model.kpi.todayCostUsd)}
-        secondary={
-          statisticsFailed
-            ? t('dashboard.feedback.sectionFailed')
-            : t('dashboard.kpi.costNoBaseline')
-        }
-        deltaPercent={null}
+        secondary={statisticsFailed ? t('dashboard.feedback.sectionFailed') : undefined}
+        deltaPercent={statisticsFailed ? null : model.kpi.todayCostUsd.deltaPercent}
+        sparkline={statisticsFailed ? [] : model.kpi.todayCostUsd.sparkline}
         tone="default"
       />
     </section>
@@ -298,7 +320,10 @@ function TrendRow({
       <article className="dashboard-card dashboard-trend-card">
         <header className="dashboard-card-header">
           <div>
-            <h2 className="dashboard-card-title">{t('dashboard.trend.title')}</h2>
+            <div className="dashboard-card-title-wrap">
+              <h2 className="dashboard-card-title">{t('dashboard.trend.title')}</h2>
+              <InfoTooltip label={t('dashboard.info.show')} content={t('dashboard.info.trend')} />
+            </div>
             <p className="dashboard-card-subtitle">{t('dashboard.trend.subtitle')}</p>
           </div>
           <div className="dashboard-trend-legend">
@@ -337,15 +362,23 @@ function TrendRow({
         <DistributionShareCard
           title={t('dashboard.topModels.title')}
           subtitle={t('dashboard.topModels.subtitle')}
+          infoLabel={t('dashboard.info.show')}
+          infoContent={t('dashboard.info.topModels')}
           rows={model.topModels}
           emptyText={t('dashboard.top.empty')}
+          failed={statisticsFailed}
+          failedText={t('dashboard.feedback.sectionFailed')}
           tokenUnitLocale={tokenUnitLocale}
         />
         <DistributionShareCard
           title={t('dashboard.topApps.title')}
           subtitle={t('dashboard.topApps.subtitle')}
+          infoLabel={t('dashboard.info.show')}
+          infoContent={t('dashboard.info.topApps')}
           rows={model.topApps}
           emptyText={t('dashboard.top.empty')}
+          failed={statisticsFailed}
+          failedText={t('dashboard.feedback.sectionFailed')}
           tokenUnitLocale={tokenUnitLocale}
           renderLabel={(row) => (
             <span className="dashboard-share-app">
@@ -362,15 +395,23 @@ function TrendRow({
 function DistributionShareCard({
   title,
   subtitle,
+  infoLabel,
+  infoContent,
   rows,
   emptyText,
+  failed = false,
+  failedText,
   tokenUnitLocale,
   renderLabel,
 }: {
   title: string;
   subtitle: string;
+  infoLabel: string;
+  infoContent: string;
   rows: DashboardViewModel['topModels'];
   emptyText: string;
+  failed?: boolean;
+  failedText?: string;
   tokenUnitLocale: string;
   renderLabel?: Parameters<typeof ShareBar>[0]['renderLabel'];
 }) {
@@ -378,32 +419,28 @@ function DistributionShareCard({
     <article className="dashboard-card dashboard-distribution-card">
       <header className="dashboard-card-header">
         <div>
-          <h2 className="dashboard-card-title">{title}</h2>
+          <div className="dashboard-card-title-wrap">
+            <h2 className="dashboard-card-title">{title}</h2>
+            <InfoTooltip label={infoLabel} content={infoContent} />
+          </div>
           <p className="dashboard-card-subtitle">{subtitle}</p>
         </div>
       </header>
       <div className="dashboard-card-body">
-        <ShareBar
-          rows={rows}
-          emptyText={emptyText}
-          tokenUnitLocale={tokenUnitLocale}
-          renderLabel={renderLabel}
-        />
+        {failed ? (
+          <EmptyState compact>
+            <p>{failedText ?? emptyText}</p>
+          </EmptyState>
+        ) : (
+          <ShareBar
+            rows={rows}
+            emptyText={emptyText}
+            tokenUnitLocale={tokenUnitLocale}
+            renderLabel={renderLabel}
+          />
+        )}
       </div>
     </article>
-  );
-}
-
-function DashboardSkeleton() {
-  return (
-    <>
-      <section className="dashboard-card dashboard-skeleton-strip" aria-hidden="true">
-        <span /> <span /> <span />
-      </section>
-      <section className="dashboard-row dashboard-row-2 dashboard-skeleton-rows" aria-hidden="true">
-        <span /> <span />
-      </section>
-    </>
   );
 }
 
@@ -655,6 +692,12 @@ function formatTokens(d: DashboardKpiDelta, tokenUnitLocale: string): string {
 
 function formatCost(d: DashboardKpiCostDelta): string {
   return COST_FORMATTER.format(d.valueUsd);
+}
+
+function formatCount(value: number, locale: 'zh' | 'en'): string {
+  return new Intl.NumberFormat(locale === 'zh' ? 'zh-CN' : 'en-US', {
+    maximumFractionDigits: 0,
+  }).format(value);
 }
 
 function formatDashboardTokenTick(value: number, tokenUnitLocale: string) {
