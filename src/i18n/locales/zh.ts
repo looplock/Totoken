@@ -326,6 +326,7 @@ export const zhMessages = {
   'dashboard.feedback.runtimeRequired': '概览页需要在 Tauri 应用内运行。',
   'dashboard.feedback.partialFailure': '部分数据加载失败：{areas}',
   'dashboard.feedback.loadFailed': '加载概览失败',
+  'dashboard.feedback.loading': '正在加载概览数据...',
   'dashboard.feedback.sectionFailed': '加载失败',
   'dashboard.feedback.refreshing': '正在刷新…',
   'dashboard.section.scanner': '扫描器',

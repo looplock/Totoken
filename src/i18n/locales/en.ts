@@ -339,6 +339,7 @@ export const enMessages = {
   'dashboard.feedback.runtimeRequired': 'The Dashboard requires the Tauri desktop runtime.',
   'dashboard.feedback.partialFailure': 'Some data failed to load: {areas}',
   'dashboard.feedback.loadFailed': 'Failed to load dashboard',
+  'dashboard.feedback.loading': 'Loading dashboard data...',
   'dashboard.feedback.sectionFailed': 'Failed to load',
   'dashboard.feedback.refreshing': 'Refreshing\u2026',
   'dashboard.section.scanner': 'scanner',

@@ -165,7 +165,7 @@ export function DashboardPage() {
       ) : null}
 
       {initialLoading && !model ? (
-        <DashboardSkeleton />
+        <EmptyState>{t('dashboard.feedback.loading')}</EmptyState>
       ) : model ? (
         <>
           <KpiRow model={model} t={t} locale={locale} tokenUnitLocale={tokenUnitLocale} now={now} />
@@ -441,23 +441,6 @@ function DistributionShareCard({
         )}
       </div>
     </article>
-  );
-}
-
-function DashboardSkeleton() {
-  return (
-    <>
-      <section className="dashboard-skeleton-kpis" aria-hidden="true">
-        <span /> <span /> <span /> <span />
-      </section>
-      <section className="dashboard-row dashboard-row-2 dashboard-skeleton-rows" aria-hidden="true">
-        <span />
-        <div className="dashboard-skeleton-stack">
-          <span />
-          <span />
-        </div>
-      </section>
-    </>
   );
 }
 
