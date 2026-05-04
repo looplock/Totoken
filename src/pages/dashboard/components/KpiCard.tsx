@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { ArrowDownRight, ArrowUpRight } from 'lucide-react';
 
 export type KpiCardTone = 'default' | 'success' | 'warning' | 'danger';
 export type KpiDeltaDirection = 'up' | 'down' | 'flat';
@@ -14,6 +15,7 @@ export interface KpiCardProps {
   /** Percent (-1..+∞ in absolute units, e.g. 12.4 for +12.4%). When `null`
    *  we render an em-dash and skip the up/down arrow entirely. */
   deltaPercent?: number | null;
+  sparkline?: number[];
   /** Tone affects the card's accent rail; the delta colour is independent. */
   tone?: KpiCardTone;
   /** Slot for a tiny inline graphic — Sparkline goes here in P3. */
@@ -39,6 +41,7 @@ export function KpiCard({
   value,
   secondary,
   deltaPercent,
+  sparkline,
   tone = 'default',
   trailing,
 }: KpiCardProps) {
@@ -52,31 +55,65 @@ export function KpiCard({
       <div className="dashboard-kpi-value">{value}</div>
       <footer className="dashboard-kpi-foot">
         {secondary ? <span className="dashboard-kpi-secondary">{secondary}</span> : <span />}
-        <span
-          className={`dashboard-kpi-delta dashboard-kpi-delta-${deltaInfo.direction}`}
-          aria-label={deltaInfo.ariaLabel}
-        >
-          {deltaInfo.symbol}
-          {deltaInfo.label}
+        <span className="dashboard-kpi-trend">
+          <span
+            className={`dashboard-kpi-delta dashboard-kpi-delta-${deltaInfo.direction}`}
+            aria-label={deltaInfo.ariaLabel}
+          >
+            {deltaInfo.direction === 'down' ? <ArrowDownRight size={14} /> : null}
+            {deltaInfo.direction === 'up' || deltaInfo.direction === 'flat' ? (
+              <ArrowUpRight size={14} />
+            ) : null}
+            {deltaInfo.label}
+          </span>
+          {sparkline && sparkline.length > 0 ? <DashboardKpiSparkline values={sparkline} /> : null}
         </span>
       </footer>
     </article>
   );
 }
 
+function DashboardKpiSparkline({ values }: { values: number[] }) {
+  const width = 74;
+  const height = 26;
+  const path = buildLinePath(values.length > 0 ? values : [0], width, height, 2);
+
+  return (
+    <svg className="dashboard-kpi-sparkline" viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
+      <path d={path} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function buildLinePath(values: number[], width: number, height: number, inset: number) {
+  if (values.length === 0) {
+    return '';
+  }
+
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = max - min || 1;
+
+  return values
+    .map((value, index) => {
+      const x = inset + (index / Math.max(1, values.length - 1)) * (width - inset * 2);
+      const y = height - inset - ((value - min) / range) * (height - inset * 2);
+      return `${index === 0 ? 'M' : 'L'}${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(' ');
+}
+
 function describeDelta(deltaPercent: number | null | undefined): {
   direction: KpiDeltaDirection | 'none';
-  symbol: string;
   label: string;
   ariaLabel: string;
 } {
   if (deltaPercent === null || deltaPercent === undefined || !Number.isFinite(deltaPercent)) {
-    return { direction: 'none', symbol: '', label: '—', ariaLabel: 'no comparison' };
+    return { direction: 'none', label: '—', ariaLabel: 'no comparison' };
   }
   if (Math.abs(deltaPercent) <= 0.05) {
     return {
       direction: 'flat',
-      symbol: '·',
       label: ' 0%',
       ariaLabel: 'no change',
     };
@@ -84,14 +121,12 @@ function describeDelta(deltaPercent: number | null | undefined): {
   if (deltaPercent > 0) {
     return {
       direction: 'up',
-      symbol: '↑',
       label: ` ${PERCENT_FORMATTER.format(deltaPercent)}%`,
       ariaLabel: `up ${PERCENT_FORMATTER.format(deltaPercent)} percent`,
     };
   }
   return {
     direction: 'down',
-    symbol: '↓',
     label: ` ${PERCENT_FORMATTER.format(Math.abs(deltaPercent))}%`,
     ariaLabel: `down ${PERCENT_FORMATTER.format(Math.abs(deltaPercent))} percent`,
   };

@@ -9,15 +9,18 @@ export type DashboardScannerSnapshot = {
 export type DashboardKpiDelta = {
   value: number;
   deltaPercent: number | null;
+  sparkline: number[];
 };
 
 export type DashboardKpiCostDelta = {
   valueUsd: number;
   deltaPercent: number | null;
+  sparkline: number[];
 };
 
 export type DashboardKpi = {
   todayTokens: DashboardKpiDelta;
+  todaySessions: DashboardKpiDelta;
   todayCostUsd: DashboardKpiCostDelta;
 };
 
@@ -41,6 +44,5 @@ export type DashboardViewModel = {
   trendToday: DashboardTrendPoint[];
   topModels: DashboardTopRow[];
   topApps: DashboardTopRow[];
-  loadedAt: string;
   partialFailures: DashboardSection[];
 };
