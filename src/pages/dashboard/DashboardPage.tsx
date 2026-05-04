@@ -447,11 +447,15 @@ function DistributionShareCard({
 function DashboardSkeleton() {
   return (
     <>
-      <section className="dashboard-card dashboard-skeleton-strip" aria-hidden="true">
+      <section className="dashboard-skeleton-kpis" aria-hidden="true">
         <span /> <span /> <span /> <span />
       </section>
       <section className="dashboard-row dashboard-row-2 dashboard-skeleton-rows" aria-hidden="true">
-        <span /> <span />
+        <span />
+        <div className="dashboard-skeleton-stack">
+          <span />
+          <span />
+        </div>
       </section>
     </>
   );
