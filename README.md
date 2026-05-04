@@ -6,6 +6,9 @@
     <a href="README.zh-CN.md">简体中文</a>
   </p>
   <p>
+    <a href="https://github.com/looplock/Totoken/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/looplock/Totoken/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://github.com/looplock/Totoken/releases/latest"><img alt="Latest Release" src="https://img.shields.io/github/v/release/looplock/Totoken"></a>
+    <a href="https://github.com/looplock/Totoken/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/looplock/Totoken/total"></a>
     <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
     <a href="https://tauri.app/"><img alt="Tauri 2" src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white"></a>
     <a href="https://react.dev/"><img alt="React 18" src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=111111"></a>
