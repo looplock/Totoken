@@ -16,6 +16,9 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 const DEFAULT_THEME: &str = "blue-light";
 const SCAN_MODE_AUTO: &str = "auto";
 const SCAN_MODE_MANUAL: &str = "manual";
+const CLOSE_ACTION_QUIT: &str = "quit";
+const CLOSE_ACTION_TRAY: &str = "tray";
+pub const TRAY_ICON_ID: &str = "totoken-main";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +41,8 @@ pub struct UiPreferencesSettings {
     pub notifications: bool,
     #[serde(default = "default_true")]
     pub localized_token_units: bool,
+    #[serde(default = "default_close_action")]
+    pub close_action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,9 +75,12 @@ pub fn get_settings(app: &AppHandle) -> AppResult<SettingsState> {
     let normalized_theme = normalize_theme(&settings.ui_preferences.theme);
     let theme_changed = settings.ui_preferences.theme != normalized_theme;
     settings.ui_preferences.theme = normalized_theme;
+    let normalized_close_action = normalize_close_action(&settings.ui_preferences.close_action);
+    let close_action_changed = settings.ui_preferences.close_action != normalized_close_action;
+    settings.ui_preferences.close_action = normalized_close_action;
     validate_settings(&settings)?;
 
-    if scan_mode_changed || theme_changed {
+    if scan_mode_changed || theme_changed || close_action_changed {
         write_settings_file(&settings_path, &settings)?;
     }
 
@@ -82,9 +90,12 @@ pub fn get_settings(app: &AppHandle) -> AppResult<SettingsState> {
 pub fn update_settings(app: &AppHandle, mut settings: SettingsState) -> AppResult<SettingsState> {
     settings.scheduler.scan_mode = normalize_scan_mode(&settings.scheduler.scan_mode);
     settings.ui_preferences.theme = normalize_theme(&settings.ui_preferences.theme);
+    settings.ui_preferences.close_action =
+        normalize_close_action(&settings.ui_preferences.close_action);
     validate_settings(&settings)?;
     let settings_path = resolve_settings_path(app)?;
     write_settings_file(&settings_path, &settings)?;
+    sync_tray_visibility_for_close_action(app, &settings.ui_preferences.close_action);
     Ok(settings)
 }
 
@@ -92,6 +103,7 @@ pub fn reset_settings(app: &AppHandle) -> AppResult<SettingsState> {
     let defaults = default_settings();
     let settings_path = resolve_settings_path(app)?;
     write_settings_file(&settings_path, &defaults)?;
+    sync_tray_visibility_for_close_action(app, &defaults.ui_preferences.close_action);
     Ok(defaults)
 }
 
@@ -146,6 +158,17 @@ fn normalize_theme(theme: &str) -> String {
 
 fn validate_settings(settings: &SettingsState) -> AppResult<()> {
     validate_scheduler_settings(&settings.scheduler)?;
+    validate_ui_preferences_settings(&settings.ui_preferences)?;
+    Ok(())
+}
+
+fn validate_ui_preferences_settings(settings: &UiPreferencesSettings) -> AppResult<()> {
+    if settings.close_action != CLOSE_ACTION_QUIT && settings.close_action != CLOSE_ACTION_TRAY {
+        return Err(AppError::validation(
+            "uiPreferences.closeAction must be quit or tray",
+        ));
+    }
+
     Ok(())
 }
 
@@ -227,6 +250,7 @@ pub fn default_settings() -> SettingsState {
             language: "en-US".to_string(),
             notifications: true,
             localized_token_units: true,
+            close_action: CLOSE_ACTION_QUIT.to_string(),
         },
     }
 }
@@ -239,9 +263,65 @@ fn default_true() -> bool {
     true
 }
 
+fn default_close_action() -> String {
+    CLOSE_ACTION_QUIT.to_string()
+}
+
 fn normalize_scan_mode(value: &str) -> String {
     match value {
         SCAN_MODE_MANUAL => SCAN_MODE_MANUAL.to_string(),
         _ => SCAN_MODE_AUTO.to_string(),
+    }
+}
+
+fn normalize_close_action(value: &str) -> String {
+    match value {
+        CLOSE_ACTION_TRAY => CLOSE_ACTION_TRAY.to_string(),
+        _ => CLOSE_ACTION_QUIT.to_string(),
+    }
+}
+
+pub fn should_hide_to_tray_on_close(app: &AppHandle) -> bool {
+    get_settings(app)
+        .map(|settings| settings.ui_preferences.close_action == CLOSE_ACTION_TRAY)
+        .unwrap_or(false)
+}
+
+pub fn sync_tray_visibility(app: &AppHandle) {
+    let visible = should_hide_to_tray_on_close(app);
+    sync_tray_visibility_for_close_action(
+        app,
+        if visible {
+            CLOSE_ACTION_TRAY
+        } else {
+            CLOSE_ACTION_QUIT
+        },
+    );
+}
+
+fn sync_tray_visibility_for_close_action(app: &AppHandle, close_action: &str) {
+    let Some(tray) = app.tray_by_id(TRAY_ICON_ID) else {
+        return;
+    };
+
+    if let Err(error) = tray.set_visible(close_action == CLOSE_ACTION_TRAY) {
+        log::warn!("failed to update system tray visibility: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_action_normalization_preserves_quit_and_tray() {
+        assert_eq!(normalize_close_action("quit"), "quit");
+        assert_eq!(normalize_close_action("tray"), "tray");
+    }
+
+    #[test]
+    fn close_action_normalization_defaults_unknown_values_to_quit() {
+        assert_eq!(normalize_close_action(""), "quit");
+        assert_eq!(normalize_close_action("minimize"), "quit");
     }
 }

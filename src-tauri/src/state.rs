@@ -18,6 +18,7 @@ const MAX_CHANGE_RATE_HISTORY_POINTS: usize = 24;
 #[derive(Debug, Clone, Copy)]
 pub enum AutoScanSignal {
     RefreshNow,
+    SettingsChanged,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,10 +192,21 @@ impl AppState {
     }
 
     pub fn notify_auto_scan_refresh(&self) {
+        self.notify_auto_scan(AutoScanSignal::RefreshNow, "notify_auto_scan_refresh");
+    }
+
+    pub fn notify_auto_scan_settings_changed(&self) {
+        self.notify_auto_scan(
+            AutoScanSignal::SettingsChanged,
+            "notify_auto_scan_settings_changed",
+        );
+    }
+
+    fn notify_auto_scan(&self, signal: AutoScanSignal, action_name: &str) {
         match self.auto_scan_signal_sender.lock() {
             Ok(slot) => {
                 if let Some(sender) = slot.as_ref() {
-                    let _ = sender.send(AutoScanSignal::RefreshNow);
+                    let _ = sender.send(signal);
                 }
             }
             Err(error) => {
@@ -202,7 +214,7 @@ impl AppState {
                 self.log_warning(
                     "system",
                     "state",
-                    "notify_auto_scan_refresh",
+                    action_name,
                     "auto_scan_signal_sender poisoned during refresh notify",
                     Some(error.to_string()),
                     BTreeMap::new(),
@@ -243,6 +255,16 @@ impl AppState {
             runtime.is_auto_scan_running = false;
             runtime.current_interval_seconds = None;
             runtime.next_scan_at = None;
+        });
+    }
+
+    pub fn mark_auto_scan_rescheduled(&self, next_interval_seconds: Option<u64>) {
+        self.with_auto_scan_runtime("mark_auto_scan_rescheduled", (), |runtime| {
+            let now = Utc::now();
+            runtime.current_interval_seconds = next_interval_seconds;
+            runtime.next_scan_at = next_interval_seconds
+                .and_then(|seconds| Duration::try_seconds(seconds as i64))
+                .map(|duration| now + duration);
         });
     }
 

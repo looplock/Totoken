@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, FolderOpen, FolderCog, Info, RotateCcw, Save, Search } from 'lucide-react';
+import { ChevronDown, FolderOpen, FolderCog, Info, RotateCcw, Search } from 'lucide-react';
 import { useI18n } from '../../i18n/useI18n';
 import { EmptyState } from '../../components/empty-state/EmptyState';
 import { Switch } from '../../components/switch/Switch';
@@ -9,6 +9,7 @@ import { useTheme } from '../../theme/useTheme';
 import { composeThemeMode, splitThemeMode, type ThemeFamily } from '../../theme/themes';
 import {
   createDefaultSettings,
+  type CloseAction,
   type ScanMode,
   type SchedulerPreview,
   type SettingsState,
@@ -81,7 +82,8 @@ function settingsEqual(left: SettingsState, right: SettingsState) {
     left.uiPreferences.theme === right.uiPreferences.theme &&
     left.uiPreferences.language === right.uiPreferences.language &&
     left.uiPreferences.notifications === right.uiPreferences.notifications &&
-    left.uiPreferences.localizedTokenUnits === right.uiPreferences.localizedTokenUnits
+    left.uiPreferences.localizedTokenUnits === right.uiPreferences.localizedTokenUnits &&
+    left.uiPreferences.closeAction === right.uiPreferences.closeAction
   );
 }
 
@@ -101,7 +103,6 @@ export function SettingsPage() {
     return defaults;
   });
   const [search, setSearch] = useState('');
-  const [saveMessageVisible, setSaveMessageVisible] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [hasLoadedSettings, setHasLoadedSettings] = useState(false);
@@ -185,8 +186,11 @@ export function SettingsPage() {
         t('settings.preferences.themeLight'),
         t('settings.preferences.themeDark'),
         t('settings.preferences.language'),
+        t('settings.preferences.closeAction'),
+        t('settings.preferences.closeActionQuit'),
+        t('settings.preferences.closeActionTray'),
         t('settings.preferences.tokenUnits'),
-        'ui alerts language theme token units blue green amber light dark',
+        'ui alerts language theme close quit tray token units blue green amber light dark',
       )
     ) {
       result.add('preferences');
@@ -198,7 +202,6 @@ export function SettingsPage() {
   const hasVisibleSections = visibleSections.size > 0;
 
   const updateSettings = (updater: (current: SettingsState) => SettingsState) => {
-    setSaveMessageVisible(false);
     setErrorMessage(null);
     setSettings((current) => updater(current));
   };
@@ -222,44 +225,6 @@ export function SettingsPage() {
     [applyUiPreferences],
   );
 
-  const persistUiPreferences = async (uiPreferences: SettingsState['uiPreferences']) => {
-    const previousSavedSettings = savedSettings;
-    const nextPersistedSettings: SettingsState = {
-      ...previousSavedSettings,
-      uiPreferences,
-    };
-
-    setSaveMessageVisible(false);
-    setErrorMessage(null);
-    setSettings((current) => ({
-      ...current,
-      uiPreferences,
-    }));
-    applyUiPreferences(uiPreferences);
-    setIsSaving(true);
-
-    try {
-      const saved = await saveSettings(nextPersistedSettings);
-      setSavedSettings(saved);
-      setSettings((current) => ({
-        ...current,
-        uiPreferences: saved.uiPreferences,
-      }));
-      syncUiPreferenceEffects(saved.uiPreferences);
-    } catch (error) {
-      setSettings((current) => ({
-        ...current,
-        uiPreferences: previousSavedSettings.uiPreferences,
-      }));
-      syncUiPreferenceEffects(previousSavedSettings.uiPreferences);
-
-      const message = error instanceof Error ? error.message : t('settings.feedback.saveFailed');
-      setErrorMessage(message);
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
   useEffect(() => {
     let cancelled = false;
 
@@ -267,7 +232,6 @@ export function SettingsPage() {
       setIsLoading(true);
       setHasLoadedSettings(false);
       setErrorMessage(null);
-      setSaveMessageVisible(false);
 
       try {
         const loaded = await fetchSettings();
@@ -278,7 +242,6 @@ export function SettingsPage() {
         setSettings(loaded);
         setSavedSettings(loaded);
         setHasLoadedSettings(true);
-        setSaveMessageVisible(false);
         syncUiPreferenceEffects(loaded.uiPreferences);
 
         const storage = await fetchStorageConfig();
@@ -294,7 +257,6 @@ export function SettingsPage() {
         const message = error instanceof Error ? error.message : t('settings.feedback.loadFailed');
         setHasLoadedSettings(false);
         setErrorMessage(message);
-        setSaveMessageVisible(false);
       } finally {
         if (!cancelled) {
           setIsLoading(false);
@@ -330,29 +292,43 @@ export function SettingsPage() {
     };
   }, [settings.scheduler]);
 
-  const saveChanges = async () => {
-    if (!hasLoadedSettings) {
-      setErrorMessage(t('settings.feedback.loadFailed'));
+  useEffect(() => {
+    if (!hasLoadedSettings || isLoading || !dirty) {
       return;
     }
 
-    setIsSaving(true);
-    setErrorMessage(null);
+    let cancelled = false;
+    const timeoutId = window.setTimeout(async () => {
+      setIsSaving(true);
+      setErrorMessage(null);
 
-    try {
-      const saved = await saveSettings(settings);
-      setSettings(saved);
-      setSavedSettings(saved);
-      setSaveMessageVisible(true);
-      syncUiPreferenceEffects(saved.uiPreferences);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : t('settings.feedback.saveFailed');
-      setErrorMessage(message);
-      setSaveMessageVisible(false);
-    } finally {
-      setIsSaving(false);
-    }
-  };
+      try {
+        const saved = await saveSettings(settings);
+        if (cancelled) {
+          return;
+        }
+
+        setSavedSettings(saved);
+        setSettings((current) => (settingsEqual(current, settings) ? saved : current));
+        syncUiPreferenceEffects(saved.uiPreferences);
+      } catch (error) {
+        if (!cancelled) {
+          const message =
+            error instanceof Error ? error.message : t('settings.feedback.saveFailed');
+          setErrorMessage(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSaving(false);
+        }
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [dirty, hasLoadedSettings, isLoading, settings, syncUiPreferenceEffects, t]);
 
   const restoreDefaults = async () => {
     if (!hasLoadedSettings) {
@@ -367,7 +343,6 @@ export function SettingsPage() {
       const defaults = await resetSettings();
       setSettings(defaults);
       setSavedSettings(defaults);
-      setSaveMessageVisible(false);
       syncUiPreferenceEffects(defaults.uiPreferences);
     } catch (error) {
       const message = error instanceof Error ? error.message : t('settings.feedback.resetFailed');
@@ -380,7 +355,6 @@ export function SettingsPage() {
   const updateStoragePath = async (nextPath: string | null) => {
     setIsUpdatingStorage(true);
     setErrorMessage(null);
-    setSaveMessageVisible(false);
 
     try {
       const nextStorage = await setStorageDataDir(nextPath);
@@ -436,16 +410,6 @@ export function SettingsPage() {
             <RotateCcw size={16} />
             <span>{t('settings.actions.restore')}</span>
           </button>
-
-          <button
-            type="button"
-            className="settings-btn settings-btn-primary"
-            onClick={() => void saveChanges()}
-            disabled={!canEditSettings || !dirty || isSaving}
-          >
-            <Save size={16} />
-            <span>{t('settings.actions.save')}</span>
-          </button>
         </div>
       </section>
 
@@ -453,13 +417,6 @@ export function SettingsPage() {
         <div className="settings-notice">
           <Info size={17} />
           <span>{errorMessage}</span>
-        </div>
-      ) : null}
-
-      {saveMessageVisible ? (
-        <div className="settings-notice">
-          <Info size={17} />
-          <span>{t('settings.feedback.saved')}</span>
         </div>
       ) : null}
 
@@ -827,15 +784,23 @@ export function SettingsPage() {
                             <select
                               className="settings-select"
                               value={currentThemeFamily}
-                              onChange={(event) =>
-                                void persistUiPreferences({
+                              onChange={(event) => {
+                                const nextTheme = composeThemeMode(
+                                  event.target.value as ThemeFamily,
+                                  currentThemeAppearance,
+                                );
+                                applyUiPreferences({
                                   ...settings.uiPreferences,
-                                  theme: composeThemeMode(
-                                    event.target.value as ThemeFamily,
-                                    currentThemeAppearance,
-                                  ),
-                                })
-                              }
+                                  theme: nextTheme,
+                                });
+                                updateSettings((current) => ({
+                                  ...current,
+                                  uiPreferences: {
+                                    ...current.uiPreferences,
+                                    theme: nextTheme,
+                                  },
+                                }));
+                              }}
                             >
                               {THEME_GROUPS.map(({ family, labelKey }) => (
                                 <option key={family} value={family}>
@@ -861,15 +826,23 @@ export function SettingsPage() {
                           <Switch
                             size="sm"
                             checked={currentThemeAppearance === 'dark'}
-                            onToggle={() =>
-                              void persistUiPreferences({
+                            onToggle={() => {
+                              const nextTheme = composeThemeMode(
+                                currentThemeFamily,
+                                currentThemeAppearance === 'dark' ? 'light' : 'dark',
+                              );
+                              applyUiPreferences({
                                 ...settings.uiPreferences,
-                                theme: composeThemeMode(
-                                  currentThemeFamily,
-                                  currentThemeAppearance === 'dark' ? 'light' : 'dark',
-                                ),
-                              })
-                            }
+                                theme: nextTheme,
+                              });
+                              updateSettings((current) => ({
+                                ...current,
+                                uiPreferences: {
+                                  ...current.uiPreferences,
+                                  theme: nextTheme,
+                                },
+                              }));
+                            }}
                             label={t('settings.preferences.themeDark')}
                           />
                         </div>
@@ -886,14 +859,47 @@ export function SettingsPage() {
                           value={settings.uiPreferences.language}
                           onChange={(event) => {
                             const nextLanguage = event.target.value as 'zh-CN' | 'en-US';
-                            void persistUiPreferences({
+                            applyUiPreferences({
                               ...settings.uiPreferences,
                               language: nextLanguage,
                             });
+                            updateSettings((current) => ({
+                              ...current,
+                              uiPreferences: {
+                                ...current.uiPreferences,
+                                language: nextLanguage,
+                              },
+                            }));
                           }}
                         >
                           <option value="en-US">English (US)</option>
                           <option value="zh-CN">简体中文</option>
+                        </select>
+                        <ChevronDown size={16} />
+                      </div>
+                    </label>
+
+                    <label className="settings-field settings-preference-item settings-control-card settings-control-card-field">
+                      <span className="settings-field-label">
+                        {t('settings.preferences.closeAction')}
+                      </span>
+                      <div className="settings-select-wrap">
+                        <select
+                          className="settings-select"
+                          value={settings.uiPreferences.closeAction}
+                          onChange={(event) => {
+                            const nextCloseAction = event.target.value as CloseAction;
+                            updateSettings((current) => ({
+                              ...current,
+                              uiPreferences: {
+                                ...current.uiPreferences,
+                                closeAction: nextCloseAction,
+                              },
+                            }));
+                          }}
+                        >
+                          <option value="quit">{t('settings.preferences.closeActionQuit')}</option>
+                          <option value="tray">{t('settings.preferences.closeActionTray')}</option>
                         </select>
                         <ChevronDown size={16} />
                       </div>
