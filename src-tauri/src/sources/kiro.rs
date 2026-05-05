@@ -122,11 +122,36 @@ impl SourceAdapter for KiroAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        9
+        11
     }
 
     fn can_handle(&self, path: &Path) -> bool {
         is_kiro_workspace_session_path(path)
+    }
+
+    fn has_scannable_data(&self, root_path: &Path) -> AppResult<bool> {
+        if root_path.is_file() {
+            return Ok(self.can_handle(root_path)
+                && is_discoverable_kiro_workspace_session_file(root_path));
+        }
+
+        for sessions_root in resolve_kiro_workspace_sessions_roots(root_path) {
+            for entry in walkdir::WalkDir::new(sessions_root)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+
+                let path = entry.path();
+                if self.can_handle(path) && is_discoverable_kiro_workspace_session_file(path) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     fn discover_paths(&self, root_path: &Path) -> AppResult<Vec<PathBuf>> {
@@ -259,6 +284,7 @@ impl SourceAdapter for KiroAdapter {
                 raw_role,
                 text_content.as_deref(),
             );
+            let used_borrowed_execution_id = borrowed_execution_id.is_some();
             let role = borrowed_execution_id
                 .as_ref()
                 .map(|_| "assistant".to_string())
@@ -284,10 +310,12 @@ impl SourceAdapter for KiroAdapter {
                 chat_summary
                     .and_then(|summary| summary.assistant_tokens_estimate)
                     .or_else(|| {
-                        text_content
-                            .as_deref()
-                            .map(estimate_text_tokens)
-                            .filter(|value| *value > 0)
+                        used_borrowed_execution_id.then(|| {
+                            text_content
+                                .as_deref()
+                                .map(estimate_text_tokens)
+                                .filter(|value| *value > 0)
+                        })?
                     })
             } else {
                 text_content
@@ -295,15 +323,14 @@ impl SourceAdapter for KiroAdapter {
                     .map(estimate_text_tokens)
                     .filter(|value| *value > 0)
             };
-            let estimated_request_input_tokens = extract_prompt_logs_prompt(entry)
-                .as_deref()
-                .map(estimate_text_tokens)
-                .filter(|value| *value > 0);
+            let estimated_request_input_tokens = estimate_prompt_logs_input_tokens(entry);
             let estimated_request_output_tokens = extract_prompt_logs_completion(entry)
                 .as_deref()
                 .map(estimate_text_tokens)
-                .filter(|value| *value > 0)
-                .or_else(|| chat_summary.and_then(|summary| summary.assistant_tokens_estimate))
+                .filter(|value| *value > 0);
+            let estimated_request_output_tokens = chat_summary
+                .and_then(|summary| summary.assistant_tokens_estimate)
+                .or(estimated_request_output_tokens)
                 .or_else(|| {
                     (role == "assistant")
                         .then_some(estimated_message_tokens)
@@ -478,7 +505,7 @@ fn build_message_stream_aggregation(
             request.source_updated_at,
             message.source_updated_at.or(message.source_created_at),
         );
-        request.input_tokens_estimate = merge_optional_max(
+        request.input_tokens_estimate = add_optional_tokens(
             request.input_tokens_estimate,
             message.estimated_request_input_tokens,
         );
@@ -947,6 +974,17 @@ fn resolve_kiro_snapshot_roots(root: &Path) -> Vec<PathBuf> {
         }
     }
 
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() && is_kiro_desktop_snapshot_root_candidate(&path) {
+                roots.push(path);
+            }
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
     roots
 }
 
@@ -956,9 +994,17 @@ fn resolve_kiro_snapshot_watch_paths(root: &Path) -> Vec<PathBuf> {
         root.join("session-cache"),
         root.to_path_buf(),
     ];
+    paths.extend(resolve_kiro_snapshot_roots(root));
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn is_kiro_desktop_snapshot_root_candidate(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(name.len(), 32 | 40) && name.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn should_replace_kiro_chat_summary(
@@ -1029,11 +1075,13 @@ fn extract_kiro_execution_snapshot(document: &Value) -> Option<KiroExecutionSnap
 
 fn extract_kiro_chat_assistant_output(document: &Value) -> Option<String> {
     let chat = document.get("chat").and_then(Value::as_array)?;
-    let mut fallback = None::<String>;
-    let mut substantive = None::<String>;
+    let mut parts = Vec::<String>::new();
 
     for entry in chat {
-        if entry.get("role").and_then(Value::as_str) != Some("bot") {
+        if !matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("bot" | "assistant")
+        ) {
             continue;
         }
 
@@ -1045,34 +1093,167 @@ fn extract_kiro_chat_assistant_output(document: &Value) -> Option<String> {
             continue;
         }
 
-        fallback = Some(text.clone());
-        if is_substantive_kiro_chat_output(&text) {
-            substantive = Some(text);
-        }
+        parts.push(text);
     }
 
-    substantive.or(fallback)
+    join_kiro_output_parts(parts)
 }
 
 fn extract_legacy_kiro_execution_output(document: &Value) -> Option<String> {
-    let last_say = document
-        .get("actions")
-        .and_then(Value::as_array)
-        .and_then(|actions| {
-            actions.iter().rev().find_map(|action| {
-                (action.get("actionType").and_then(Value::as_str) == Some("say"))
-                    .then(|| {
-                        action
-                            .get("output")
-                            .and_then(|value| value.get("message"))
-                            .and_then(Value::as_str)
-                            .and_then(|value| normalize_optional_text(Some(value)))
-                    })
-                    .flatten()
-            })
-        });
+    let mut parts = Vec::<String>::new();
 
-    last_say.or_else(|| extract_legacy_kiro_context_bot_output(document))
+    if let Some(actions) = document.get("actions").and_then(Value::as_array) {
+        for action in actions {
+            if let Some(text) = extract_kiro_action_output_text(action) {
+                parts.push(text);
+            }
+        }
+    }
+
+    if let Some(text) = extract_kiro_result_output(document.get("result").unwrap_or(&Value::Null)) {
+        parts.push(text);
+    }
+
+    if let Some(text) = extract_legacy_kiro_context_bot_output(document) {
+        parts.push(text);
+    }
+
+    join_kiro_output_parts(parts)
+}
+
+fn extract_kiro_action_output_text(action: &Value) -> Option<String> {
+    let action_type = action.get("actionType").and_then(Value::as_str)?;
+    match action_type {
+        "create" | "write" => action
+            .get("input")
+            .and_then(extract_kiro_action_modified_content),
+        "replace" | "append" => action.get("input").and_then(|input| {
+            let modified = extract_kiro_action_modified_content(input)?;
+            let original = extract_kiro_action_original_content(input);
+            Some(estimate_kiro_modified_delta_text(
+                original.as_deref(),
+                &modified,
+            ))
+        }),
+        "say" | "compact" | "preWork" => action
+            .get("output")
+            .and_then(|value| value.get("message").or_else(|| value.get("content")))
+            .and_then(Value::as_str)
+            .and_then(normalize_content_text),
+        "summarization" => action
+            .get("output")
+            .and_then(|value| {
+                value
+                    .get("content")
+                    .or_else(|| value.get("conversationSummary"))
+                    .or_else(|| value.get("message"))
+            })
+            .and_then(Value::as_str)
+            .and_then(normalize_content_text),
+        _ => None,
+    }
+}
+
+fn extract_kiro_action_modified_content(input: &Value) -> Option<String> {
+    [
+        "modifiedContent",
+        "modified",
+        "newStr",
+        "new_string",
+        "newText",
+        "content",
+        "text",
+    ]
+    .iter()
+    .find_map(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(normalize_content_text)
+    })
+}
+
+fn extract_kiro_action_original_content(input: &Value) -> Option<String> {
+    [
+        "originalContent",
+        "original",
+        "oldStr",
+        "old_string",
+        "oldText",
+    ]
+    .iter()
+    .find_map(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(normalize_content_text)
+    })
+}
+
+fn extract_kiro_result_output(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => normalize_content_text(text),
+        Value::Object(_) => ["message", "content", "summary", "text"]
+            .iter()
+            .find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .and_then(normalize_content_text)
+            }),
+        _ => None,
+    }
+}
+
+fn estimate_kiro_modified_delta_text(original: Option<&str>, modified: &str) -> String {
+    let Some(original) = original else {
+        return modified.to_string();
+    };
+    if original.is_empty() || original == modified {
+        return if original == modified {
+            String::new()
+        } else {
+            modified.to_string()
+        };
+    }
+
+    let original_chars: Vec<char> = original.chars().collect();
+    let modified_chars: Vec<char> = modified.chars().collect();
+    let mut prefix_len = 0_usize;
+    while prefix_len < original_chars.len()
+        && prefix_len < modified_chars.len()
+        && original_chars[prefix_len] == modified_chars[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0_usize;
+    while suffix_len + prefix_len < original_chars.len()
+        && suffix_len + prefix_len < modified_chars.len()
+        && original_chars[original_chars.len() - 1 - suffix_len]
+            == modified_chars[modified_chars.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    modified_chars[prefix_len..modified_chars.len() - suffix_len]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn join_kiro_output_parts(parts: Vec<String>) -> Option<String> {
+    let filtered = parts
+        .into_iter()
+        .filter_map(|part| normalize_content_text(&part))
+        .filter(|part| !part.eq_ignore_ascii_case("On it."))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.join("\n\n"))
+    }
 }
 
 fn extract_legacy_kiro_context_bot_output(document: &Value) -> Option<String> {
@@ -1111,10 +1292,6 @@ fn normalize_kiro_execution_status(value: Option<&str>) -> Option<String> {
         "running" | "in_progress" => Some("running".to_string()),
         other => normalize_optional_text(Some(other)),
     }
-}
-
-fn is_substantive_kiro_chat_output(value: &str) -> bool {
-    value.contains('\n') || value.chars().count() >= 48 || value.split_whitespace().count() >= 12
 }
 
 fn derive_session_models(
@@ -1229,6 +1406,24 @@ fn extract_prompt_logs_prompt(entry: &Value) -> Option<String> {
             logs.iter()
                 .find_map(|log| normalize_optional_text(log.get("prompt").and_then(Value::as_str)))
         })
+}
+
+fn estimate_prompt_logs_input_tokens(entry: &Value) -> Option<i64> {
+    let total = entry
+        .get("promptLogs")
+        .and_then(Value::as_array)
+        .map(|logs| {
+            logs.iter()
+                .filter_map(|log| {
+                    normalize_optional_text(log.get("prompt").and_then(Value::as_str))
+                })
+                .map(|prompt| estimate_text_tokens(&prompt))
+                .filter(|value| *value > 0)
+                .sum::<i64>()
+        })
+        .unwrap_or_default();
+
+    (total > 0).then_some(total)
 }
 
 fn extract_prompt_logs_completion(entry: &Value) -> Option<String> {
@@ -1352,7 +1547,11 @@ fn estimate_text_tokens(value: &str) -> i64 {
     let mut cjk_chars = 0_i64;
     let mut other_chars = 0_i64;
 
-    for ch in value.chars() {
+    let sanitized = strip_inline_image_data_urls(value);
+    if sanitized.trim().is_empty() {
+        return 0;
+    }
+    for ch in sanitized.chars() {
         if ch.is_whitespace() {
             continue;
         }
@@ -1367,6 +1566,26 @@ fn estimate_text_tokens(value: &str) -> i64 {
     let estimate =
         ((other_chars as f64) / 4.0).ceil() as i64 + ((cjk_chars as f64) * 0.6).ceil() as i64;
     estimate.max(1)
+}
+
+fn strip_inline_image_data_urls(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(offset) = remaining.find("data:image/") {
+        stripped.push_str(&remaining[..offset]);
+        let data_start = offset + "data:image/".len();
+        let data_url_tail = &remaining[data_start..];
+        let data_end = data_url_tail
+            .char_indices()
+            .find_map(|(index, ch)| {
+                (ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '}' | '<' | '>'))
+                    .then_some(index)
+            })
+            .unwrap_or(data_url_tail.len());
+        remaining = &data_url_tail[data_end..];
+    }
+    stripped.push_str(remaining);
+    stripped
 }
 
 fn is_cjk_character(value: char) -> bool {
@@ -1386,6 +1605,15 @@ fn is_cjk_character(value: char) -> bool {
 fn merge_optional_max(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn add_optional_tokens(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
         (Some(left), None) => Some(left),
         (None, Some(right)) => Some(right),
         (None, None) => None,
@@ -1602,7 +1830,7 @@ mod tests {
         assert_eq!(session.model_first.as_deref(), Some("claude-sonnet-4.5"));
         assert_eq!(session.message_count, 4);
         assert!(session.total_input_tokens > 0);
-        assert!(session.total_output_tokens > 0);
+        assert_eq!(session.total_output_tokens, 0);
         assert_eq!(session.requests.len(), 2);
         assert_eq!(session.events.len(), 2);
         assert_eq!(
@@ -1615,7 +1843,7 @@ mod tests {
         );
         assert_eq!(session.message_count, 4);
         assert!(session.requests[0].input_tokens.unwrap_or(0) > 0);
-        assert!(session.requests[0].output_tokens.unwrap_or(0) > 0);
+        assert_eq!(session.requests[0].output_tokens.unwrap_or(0), 0);
         assert!(session.conversation_checksum.len() > 20);
     }
 
@@ -1716,10 +1944,73 @@ mod tests {
             .requests
             .iter()
             .all(|request| request.input_tokens.unwrap_or(0) > 0));
-        assert!(session
-            .requests
-            .iter()
-            .all(|request| request.output_tokens.unwrap_or(0) > 0));
+        assert_eq!(session.requests[0].output_tokens.unwrap_or(0), 0);
+        assert!(session.requests[1].output_tokens.unwrap_or(0) > 0);
+        assert_eq!(session.requests[2].output_tokens.unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn sums_prompt_log_input_estimates_within_the_same_request() {
+        let first_prompt = "<user> Plan the watermark removal workflow";
+        let second_prompt =
+            "<assistant> Inspect available processing tools and draft the implementation";
+        let path = write_temp_file(
+            "kiro/workspace-sessions/workspace-n/session-13.json",
+            &format!(
+                r#"{{
+  "title": "New Session",
+  "sessionId": "session-13",
+  "defaultModelTitle": "Agent",
+  "selectedModel": "claude-sonnet-4.5",
+  "history": [
+    {{
+      "message": {{
+        "role": "user",
+        "content": [{{"type": "text", "text": "Build a watermark removal tool"}}],
+        "id": "user-1"
+      }},
+      "promptLogs": [
+        {{
+          "modelTitle": "Agent",
+          "prompt": "{first_prompt}",
+          "completion": "",
+          "completionOptions": {{ "model": "agent" }}
+        }}
+      ]
+    }},
+    {{
+      "message": {{
+        "role": "assistant",
+        "content": "On it.",
+        "id": "assistant-1"
+      }},
+      "executionId": "exec-summed-input",
+      "promptLogs": [
+        {{
+          "modelTitle": "Agent",
+          "prompt": "{second_prompt}",
+          "completion": "",
+          "completionOptions": {{ "model": "agent" }}
+        }}
+      ]
+    }}
+  ]
+}}"#
+            ),
+        );
+
+        let adapter = KiroAdapter::default();
+        let sessions = adapter.parse(&path).unwrap();
+        let session = &sessions[0];
+        let expected_input_tokens =
+            estimate_text_tokens(first_prompt) + estimate_text_tokens(second_prompt);
+
+        assert_eq!(session.requests.len(), 1);
+        assert_eq!(
+            session.requests[0].input_tokens,
+            Some(expected_input_tokens)
+        );
+        assert_eq!(session.total_input_tokens, expected_input_tokens);
     }
 
     #[test]
@@ -1932,6 +2223,156 @@ mod tests {
         assert!(fingerprints.iter().any(|candidate| {
             candidate.file_name().and_then(|value| value.to_str()) == Some("legacy-exec-1-snapshot")
         }));
+    }
+
+    #[test]
+    fn supplements_output_tokens_from_desktop_hash_snapshot_roots() {
+        let root = make_temp_root();
+        let path = write_temp_file_in_root(
+            &root,
+            "kiro/workspace-sessions/workspace-l/session-11.json",
+            r#"{
+  "title": "New Session",
+  "sessionId": "session-11",
+  "defaultModelTitle": "Agent",
+  "selectedModel": "claude-sonnet-4.5",
+  "history": [
+    {
+      "message": {
+        "role": "user",
+        "content": [{ "type": "text", "text": "Generate release notes" }],
+        "id": "user-1"
+      },
+      "promptLogs": [
+        {
+          "modelTitle": "Agent",
+          "prompt": "<user>\nGenerate release notes with repository context",
+          "completion": "Done.",
+          "completionOptions": { "model": "agent" }
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "On it.",
+        "id": "assistant-1"
+      },
+      "executionId": "desktop-exec-1"
+    }
+  ]
+}"#,
+        );
+        write_temp_file_in_root(
+            &root,
+            "kiro/14dc27796b1d2d3b8364e9bfcc47ea7a/414d1636299d2b9e4ce7e17fb11f63e9/desktop-exec-1-snapshot",
+            r##"{
+  "executionId": "desktop-exec-1",
+  "workflowType": "chat-agent",
+  "status": "succeed",
+  "endTime": 1775461301000,
+  "actions": [
+    {
+      "actionType": "create",
+      "input": {
+        "content": "# Release Notes\n\nAdded snapshot-aware Kiro output estimates.\nImproved parser invalidation so rescans refresh token totals."
+      }
+    }
+  ]
+}"##,
+        );
+
+        let adapter = KiroAdapter::default();
+        let sessions = adapter.parse(&path).unwrap();
+        let session = &sessions[0];
+
+        assert!(session.requests[0].output_tokens.unwrap_or(0) > 15);
+        assert_eq!(
+            session.requests[0]
+                .source_updated_at
+                .map(|value| value.timestamp_millis()),
+            Some(1775461301000)
+        );
+        assert!(adapter.fingerprint_paths(&path).iter().any(|candidate| {
+            candidate.file_name().and_then(|value| value.to_str())
+                == Some("desktop-exec-1-snapshot")
+        }));
+    }
+
+    #[test]
+    fn ignores_inline_image_data_urls_in_prompt_and_snapshot_output_estimates() {
+        let root = make_temp_root();
+        let image_payload = format!("data:image/png;base64,{}", "A".repeat(8_000));
+        let session_json = format!(
+            r#"{{
+  "title": "New Session",
+  "sessionId": "session-12",
+  "defaultModelTitle": "Agent",
+  "selectedModel": "claude-sonnet-4.5",
+  "history": [
+    {{
+      "message": {{
+        "role": "user",
+        "content": [
+          {{ "type": "imageUrl", "imageUrl": {{ "url": "{image_payload}" }} }},
+          {{ "type": "text", "text": "Describe this UI" }}
+        ],
+        "id": "user-1"
+      }},
+      "promptLogs": [
+        {{
+          "modelTitle": "Agent",
+          "prompt": "<user>\nDescribe this UI\n{image_payload}",
+          "completion": "",
+          "completionOptions": {{ "model": "agent" }}
+        }}
+      ]
+    }},
+    {{
+      "message": {{
+        "role": "assistant",
+        "content": "On it.",
+        "id": "assistant-1"
+      }},
+      "executionId": "desktop-exec-image"
+    }}
+  ]
+}}"#
+        );
+        let snapshot_json = format!(
+            r#"{{
+  "executionId": "desktop-exec-image",
+  "workflowType": "chat-agent",
+  "status": "succeed",
+  "endTime": 1775461401000,
+  "actions": [
+    {{
+      "actionType": "write",
+      "input": {{
+        "content": "Saved screenshot metadata. {image_payload}"
+      }}
+    }}
+  ]
+}}"#
+        );
+        let path = write_temp_file_in_root(
+            &root,
+            "kiro/workspace-sessions/workspace-m/session-12.json",
+            &session_json,
+        );
+        write_temp_file_in_root(
+            &root,
+            "kiro/cache/desktop-exec-image-snapshot",
+            &snapshot_json,
+        );
+
+        let adapter = KiroAdapter::default();
+        let sessions = adapter.parse(&path).unwrap();
+        let request = &sessions[0].requests[0];
+
+        assert!(request.input_tokens.unwrap_or(0) < 20);
+        assert!(request.output_tokens.unwrap_or(0) < 20);
+        assert_eq!(estimate_text_tokens(&image_payload), 0);
     }
 
     #[test]
@@ -2284,11 +2725,46 @@ mod tests {
 
         let adapter = KiroAdapter::default();
 
+        assert!(!adapter.has_scannable_data(path.parent().unwrap()).unwrap());
         assert!(adapter
             .discover_paths(path.parent().unwrap())
             .unwrap()
             .is_empty());
         assert!(adapter.parse(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn detects_scannable_workspace_session_data() {
+        let root = make_temp_root();
+        let path = write_temp_file_in_root(
+            &root,
+            "kiro/workspace-sessions/workspace-o/session-14.json",
+            r#"{
+  "title": "New Session",
+  "sessionId": "session-14",
+  "history": [
+    {
+      "message": {
+        "role": "user",
+        "content": [{"type": "text", "text": "Build the thing"}],
+        "id": "user-1"
+      }
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "On it.",
+        "id": "assistant-1"
+      },
+      "executionId": "exec-14"
+    }
+  ]
+}"#,
+        );
+
+        let adapter = KiroAdapter::default();
+
+        assert!(adapter.has_scannable_data(path.parent().unwrap()).unwrap());
     }
 
     #[test]
