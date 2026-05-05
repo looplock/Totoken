@@ -151,6 +151,7 @@ pub fn build_scheduler_preview(
 
 fn run_auto_scan_loop(app: AppHandle, state: AppState, receiver: Receiver<AutoScanSignal>) {
     let mut runtime_state = SchedulerRuntimeState::default();
+    let mut reschedule_without_scan = false;
 
     loop {
         let settings = match settings::get_settings(&app) {
@@ -160,6 +161,9 @@ fn run_auto_scan_loop(app: AppHandle, state: AppState, receiver: Receiver<AutoSc
                 let wait_seconds = DEFAULT_RETRY_INTERVAL_SECONDS;
                 match receiver.recv_timeout(Duration::from_secs(wait_seconds.max(1))) {
                     Ok(AutoScanSignal::RefreshNow) | Err(RecvTimeoutError::Timeout) => {}
+                    Ok(AutoScanSignal::SettingsChanged) => {
+                        reschedule_without_scan = true;
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
                         debug!("Auto scan worker disconnected; shutting down");
                         break;
@@ -178,7 +182,36 @@ fn run_auto_scan_loop(app: AppHandle, state: AppState, receiver: Receiver<AutoSc
                 AUTO_SCAN_SOURCE_APP
             );
             match receiver.recv_timeout(Duration::from_secs(wait_seconds.max(1))) {
-                Ok(AutoScanSignal::RefreshNow) | Err(RecvTimeoutError::Timeout) => {}
+                Ok(AutoScanSignal::RefreshNow)
+                | Ok(AutoScanSignal::SettingsChanged)
+                | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    debug!("Auto scan worker disconnected; shutting down");
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if reschedule_without_scan {
+            reschedule_without_scan = false;
+            wait_seconds = clamp_interval(settings.scheduler.base_interval, &settings.scheduler);
+            state.mark_auto_scan_rescheduled(Some(wait_seconds));
+            debug!(
+                "Auto scan settings changed for {}; rescheduled next run in {}s",
+                AUTO_SCAN_SOURCE_APP, wait_seconds
+            );
+            match receiver.recv_timeout(Duration::from_secs(wait_seconds.max(1))) {
+                Ok(AutoScanSignal::RefreshNow) => {
+                    debug!(
+                        "Received auto scan refresh signal for {}; running immediately",
+                        AUTO_SCAN_SOURCE_APP
+                    );
+                }
+                Ok(AutoScanSignal::SettingsChanged) => {
+                    reschedule_without_scan = true;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     debug!("Auto scan worker disconnected; shutting down");
                     break;
@@ -285,6 +318,13 @@ fn run_auto_scan_loop(app: AppHandle, state: AppState, receiver: Receiver<AutoSc
                     "Received auto scan refresh signal for {}; running immediately",
                     AUTO_SCAN_SOURCE_APP
                 );
+            }
+            Ok(AutoScanSignal::SettingsChanged) => {
+                debug!(
+                    "Received auto scan settings change signal for {}; rescheduling without immediate scan",
+                    AUTO_SCAN_SOURCE_APP
+                );
+                reschedule_without_scan = true;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {

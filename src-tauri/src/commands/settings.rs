@@ -34,7 +34,7 @@ pub async fn settings_update(app: AppHandle, settings: SettingsState) -> AppResu
     ) {
         Ok(saved) => {
             app.state::<crate::state::AppState>()
-                .notify_auto_scan_refresh();
+                .notify_auto_scan_settings_changed();
             Ok(saved)
         }
         Err(error) => Err(error),
@@ -55,7 +55,7 @@ pub async fn settings_reset(app: AppHandle) -> AppResult<SettingsState> {
     ) {
         Ok(defaults) => {
             app.state::<crate::state::AppState>()
-                .notify_auto_scan_refresh();
+                .notify_auto_scan_settings_changed();
             Ok(defaults)
         }
         Err(error) => Err(error),
