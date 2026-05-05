@@ -62,6 +62,14 @@ type BackendSessionsListResponse = {
 };
 
 export async function fetchSessionsList(query: SessionsListQuery): Promise<SessionsListResult> {
+  if (query.sourceApps && query.sourceApps.length === 0) {
+    return {
+      items: [],
+      totalItems: 0,
+      totalPages: 1,
+    };
+  }
+
   const payload = {
     page: query.page,
     pageSize: query.pageSize,

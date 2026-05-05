@@ -67,6 +67,10 @@ export function SessionsPage() {
   });
   const pageRows = sessions;
   const pageTokens = buildPageTokens(page, totalPages);
+  const lowConfidenceTokenTitle =
+    locale === 'zh'
+      ? '估算值：Cursor 未提供真实 token，已按本地上下文和工具结果估算。'
+      : 'Estimated value: Cursor did not provide exact token usage; estimated from local context and tool results.';
   const sourceTabs = useMemo<Array<{ key: 'all' | SourceApp; labelKey: string }>>(
     () => [
       { key: 'all', labelKey: 'session.tabs.all' },
@@ -104,7 +108,7 @@ export function SessionsPage() {
           page,
           pageSize: rowsPerPage,
           q: deferredSearch,
-          sourceApps: sourceFilter === 'all' ? undefined : [sourceFilter],
+          sourceApps: sourceFilter === 'all' ? enabledSourceApps : [sourceFilter],
           sourceStates: stateFilter === 'all' ? undefined : [stateFilter],
           sortBy: sortField,
           sortOrder: sortDirection,
@@ -131,7 +135,17 @@ export function SessionsPage() {
         }
       }
     },
-    [deferredSearch, page, rowsPerPage, sortDirection, sortField, sourceFilter, stateFilter, t],
+    [
+      deferredSearch,
+      enabledSourceApps,
+      page,
+      rowsPerPage,
+      sortDirection,
+      sortField,
+      sourceFilter,
+      stateFilter,
+      t,
+    ],
   );
 
   useEffect(() => {
@@ -277,10 +291,20 @@ export function SessionsPage() {
                         </span>
                       </td>
                       <td className="session-metric">
-                        <TokenValue value={session.inputTokens} formatter={numberFormatter} />
+                        <TokenValue
+                          value={session.inputTokens}
+                          formatter={numberFormatter}
+                          isEstimated={session.tokenConfidence === 'low'}
+                          title={lowConfidenceTokenTitle}
+                        />
                       </td>
                       <td className="session-metric">
-                        <TokenValue value={session.outputTokens} formatter={numberFormatter} />
+                        <TokenValue
+                          value={session.outputTokens}
+                          formatter={numberFormatter}
+                          isEstimated={session.tokenConfidence === 'low'}
+                          title={lowConfidenceTokenTitle}
+                        />
                       </td>
                       <td className="session-metric">
                         <CostValue value={session.estimatedCostUsd} />
@@ -369,8 +393,22 @@ export function SessionsPage() {
   );
 }
 
-function TokenValue({ value, formatter }: { value: number; formatter: Intl.NumberFormat }) {
-  return <>{formatter.format(value)}</>;
+function TokenValue({
+  value,
+  formatter,
+  isEstimated = false,
+  title,
+}: {
+  value: number;
+  formatter: Intl.NumberFormat;
+  isEstimated?: boolean;
+  title?: string;
+}) {
+  if (!isEstimated) {
+    return <>{formatter.format(value)}</>;
+  }
+
+  return <span title={title}>~{formatter.format(value)}</span>;
 }
 
 function CostValue({ value }: { value: number | null }) {
