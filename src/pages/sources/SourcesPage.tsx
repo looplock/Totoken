@@ -133,6 +133,7 @@ export function SourcesPage() {
               <tbody>
                 {sources.map((source) => {
                   const active = selectedSource?.id === source.id;
+                  const sourceName = formatSourceName(source.app, t);
                   return (
                     <tr
                       key={source.id}
@@ -141,8 +142,8 @@ export function SourcesPage() {
                     >
                       <td>
                         <span className="sources-app-cell">
-                          <AppIcon app={source.app} label={t(`session.source.${source.app}`)} />
-                          <span>{t(`session.source.${source.app}`)}</span>
+                          <AppIcon app={source.app} label={sourceName} />
+                          <span>{sourceName}</span>
                         </span>
                       </td>
                       <td>
@@ -182,7 +183,7 @@ export function SourcesPage() {
             <header className="sources-overview-header">
               <div>
                 <h2 className="sources-overview-title">
-                  {selectedSource ? t(`session.source.${selectedSource.app}`) : t('sources.empty')}
+                  {selectedSource ? formatSourceName(selectedSource.app, t) : t('sources.empty')}
                 </h2>
                 <p className="sources-overview-path">{selectedSource?.rootPath}</p>
               </div>
@@ -337,7 +338,7 @@ function buildSourceDetailRows(
   t: (key: string) => string,
 ): Array<{ label: string; value: string; tone?: 'success' | 'danger' }> {
   const rows: Array<{ label: string; value: string; tone?: 'success' | 'danger' }> = [
-    { label: t('sources.detail.name'), value: t(`session.source.${source.app}`) },
+    { label: t('sources.detail.name'), value: formatSourceName(source.app, t) },
     { label: t('sources.detail.path'), value: source.rootPath },
     {
       label: t('sources.detail.pathStatus'),
@@ -360,4 +361,15 @@ function buildSourceDetailRows(
   ];
 
   return rows;
+}
+
+function formatSourceName(sourceApp: SourceRecord['app'], t: (key: string) => string): string {
+  const baseName = t(`session.source.${sourceApp}`);
+  if (sourceApp === 'opencode') {
+    return `${baseName} ${t('sources.sourceNote.cliOnly')}`;
+  }
+  if (sourceApp === 'kilocode') {
+    return `${baseName} ${t('sources.sourceNote.vscodeExtension')}`;
+  }
+  return baseName;
 }

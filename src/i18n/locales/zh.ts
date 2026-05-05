@@ -304,6 +304,8 @@ export const zhMessages = {
   'sources.status.disabled': '已禁用',
   'sources.status.supported': '已实现',
   'sources.status.unsupported': '暂未实现',
+  'sources.sourceNote.cliOnly': '(CLI only)',
+  'sources.sourceNote.vscodeExtension': '(VS Code 插件)',
   'sources.scope.title': '扫描范围',
   'sources.scope.note': '当前来源执行扫描时会读取以下目录。',
   'sources.scope.primary': '主会话目录',
