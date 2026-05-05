@@ -588,9 +588,23 @@ impl Scanner {
                 .flatten(),
             None => None,
         };
+        let preserve_existing_model_last = should_preserve_existing_model_last(&session);
+        let effective_model_last = if preserve_existing_model_last {
+            existing_session
+                .as_ref()
+                .and_then(|existing| existing.model_last.clone())
+                .or_else(|| session.model_last.clone())
+        } else {
+            session.model_last.clone()
+        };
         let metadata_changed = match existing_session.as_ref() {
             Some(existing) => {
-                let merged = preview_session_merge(existing, &session, source_state);
+                let merged = preview_session_merge(
+                    existing,
+                    &session,
+                    source_state,
+                    effective_model_last.clone(),
+                );
                 session_metadata_changed(existing, &merged)
                     || existing_source_file_id.as_deref() != Some(source_file_id)
             }
@@ -628,7 +642,7 @@ impl Scanner {
                 session.session_key,
                 session.title,
                 session.model_first,
-                session.model_last,
+                effective_model_last,
                 session.source_created_at,
                 session.source_updated_at,
                 source_state
@@ -684,7 +698,14 @@ impl Scanner {
             ],
         )?;
 
-        let should_rebuild_request_index = inserted_observation || force_rebuild_message_index;
+        let has_request_index_payload = !session.requests.is_empty() || !session.events.is_empty();
+        let should_rebuild_request_index =
+            has_request_index_payload && (inserted_observation || force_rebuild_message_index);
+        let has_session_usage_payload = has_request_index_payload
+            || session.total_input_tokens > 0
+            || session.total_output_tokens > 0;
+        let should_update_token_totals =
+            has_session_usage_payload && (inserted_observation || force_rebuild_message_index);
 
         if should_rebuild_request_index {
             tx.execute(
@@ -697,7 +718,7 @@ impl Scanner {
                     params![session_id],
                 )?;
             }
-        } else {
+        } else if !should_update_token_totals {
             return Ok(metadata_changed);
         }
 
@@ -759,7 +780,7 @@ impl Scanner {
             )?;
         }
 
-        if inserted_observation || force_rebuild_message_index {
+        if should_rebuild_request_index {
             for event in session.events {
                 let event_id = ids::new_uuid();
                 let event_estimated_cost_usd = estimate_usage_cost(
@@ -798,7 +819,9 @@ impl Scanner {
                     ],
                 )?;
             }
+        }
 
+        if should_update_token_totals {
             tx.execute(
                 "INSERT INTO session_token_totals (session_id, input_tokens_max, output_tokens_max, total_tokens_max, last_observed_at, last_observation_id)
                  VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
@@ -863,6 +886,7 @@ fn preview_session_merge(
     existing: &ExistingSessionRecord,
     session: &NormalizedSession,
     source_state: &str,
+    effective_model_last: Option<String>,
 ) -> SessionMergePreview {
     SessionMergePreview {
         external_session_id: existing
@@ -874,11 +898,20 @@ fn preview_session_merge(
             .model_first
             .clone()
             .or_else(|| session.model_first.clone()),
-        model_last: session.model_last.clone(),
+        model_last: effective_model_last,
         source_created_at: older_timestamp(existing.source_created_at, session.source_created_at),
         source_updated_at: newer_timestamp(existing.source_updated_at, session.source_updated_at),
         source_state: source_state.to_string(),
     }
+}
+
+fn should_preserve_existing_model_last(session: &NormalizedSession) -> bool {
+    session.source_app == "cursor"
+        && session.model_last.is_none()
+        && session.requests.is_empty()
+        && session.events.is_empty()
+        && session.total_input_tokens == 0
+        && session.total_output_tokens == 0
 }
 
 fn session_metadata_changed(
@@ -1248,6 +1281,121 @@ mod tests {
             )
             .expect("load observation totals");
         assert_eq!(observation_totals, (0, 0, 0));
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn cursor_workspace_metadata_does_not_clear_global_request_index() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-cursor-workspace-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let pool = init_db_with_path(&db_path).expect("init test db");
+        let scanner = Scanner::new(pool.clone());
+
+        let now = Utc::now();
+        let mut global_session = make_session("cursor:shared", "global-checksum", 100, 30);
+        global_session.source_app = "cursor".to_string();
+        global_session.external_session_id = Some("shared".to_string());
+        global_session.title = Some("Global Cursor Session".to_string());
+        global_session.model_first = Some("gpt-4.1".to_string());
+        global_session.model_last = Some("gpt-4.1".to_string());
+        global_session.message_count = 2;
+        global_session.requests = vec![NormalizedRequest {
+            source_request_id: Some("request-1".to_string()),
+            sequence_no: 1,
+            status: Some("completed".to_string()),
+            message_count: 2,
+            model: Some("gpt-4.1".to_string()),
+            input_tokens: Some(100),
+            output_tokens: Some(30),
+            total_tokens: Some(130),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            token_confidence: Some("high".to_string()),
+            source_created_at: Some(now),
+            source_updated_at: Some(now),
+            source_locator: "global-request".to_string(),
+        }];
+
+        scanner
+            .upsert_normalized_session(
+                global_session,
+                "C:/Cursor/User/globalStorage/state.vscdb",
+                "global-source-file",
+                false,
+            )
+            .expect("insert global cursor session");
+
+        let mut workspace_session = make_session("cursor:shared", "workspace-checksum", 0, 0);
+        workspace_session.source_app = "cursor".to_string();
+        workspace_session.external_session_id = Some("shared".to_string());
+        workspace_session.title = Some("Workspace Cursor Session".to_string());
+        workspace_session.model_first = None;
+        workspace_session.model_last = None;
+        workspace_session.message_count = 0;
+        workspace_session.requests = Vec::new();
+        workspace_session.events = Vec::new();
+
+        scanner
+            .upsert_normalized_session(
+                workspace_session,
+                "C:/Cursor/User/workspaceStorage/hash/state.vscdb",
+                "workspace-source-file",
+                false,
+            )
+            .expect("insert workspace cursor metadata");
+
+        let conn = pool.get().expect("load db conn");
+        let request_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_requests", [], |row| {
+                row.get(0)
+            })
+            .expect("count requests");
+        assert_eq!(request_count, 1);
+
+        let totals = conn
+            .query_row(
+                "SELECT input_tokens_max, output_tokens_max, total_tokens_max
+                 FROM session_token_totals",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("load totals");
+        assert_eq!(totals, (100, 30, 130));
+
+        let source_ref_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_source_refs", [], |row| {
+                row.get(0)
+            })
+            .expect("count source refs");
+        assert_eq!(source_ref_count, 2);
+
+        let models = conn
+            .query_row(
+                "SELECT model_first, model_last FROM sessions WHERE session_key = ?",
+                rusqlite::params!["cursor:shared"],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .expect("load cursor models");
+        assert_eq!(
+            models,
+            (Some("gpt-4.1".to_string()), Some("gpt-4.1".to_string()))
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));

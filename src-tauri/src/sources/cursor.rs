@@ -3,6 +3,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::message_stream::{MessageStreamAggregator, MessageStreamItem, MessageTokenUsage};
@@ -12,6 +13,12 @@ use crate::utils::sqlite::SqliteSnapshot;
 use crate::utils::{hash, time};
 
 pub struct CursorAdapter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorStateDbKind {
+    Global,
+    Workspace,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CursorLocator {
@@ -57,18 +64,11 @@ impl SourceAdapter for CursorAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        2
+        3
     }
 
     fn can_handle(&self, path: &Path) -> bool {
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("state.vscdb"))
-            && path
-                .parent()
-                .and_then(|value| value.file_name())
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("globalStorage"))
+        cursor_state_db_kind(path).is_some()
     }
 
     fn discover_paths(&self, root_path: &Path) -> AppResult<Vec<PathBuf>> {
@@ -84,51 +84,41 @@ impl SourceAdapter for CursorAdapter {
                 .collect());
         }
 
-        let candidate = root_path.join("state.vscdb");
-        Ok(self
-            .can_handle(&candidate)
-            .then_some(candidate)
-            .into_iter()
-            .collect())
+        let mut paths = Vec::new();
+        self.push_candidate_path(&mut paths, root_path.join("state.vscdb"));
+        if !root_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("globalStorage"))
+        {
+            self.push_candidate_path(
+                &mut paths,
+                root_path.join("globalStorage").join("state.vscdb"),
+            );
+        }
+
+        let workspace_storage = if root_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("workspaceStorage"))
+        {
+            root_path.to_path_buf()
+        } else {
+            root_path.join("workspaceStorage")
+        };
+        self.discover_workspace_state_dbs(&workspace_storage, &mut paths)?;
+
+        Ok(paths)
     }
 
     fn parse(&self, path: &Path) -> AppResult<Vec<NormalizedSession>> {
         let snapshot = SqliteSnapshot::open(path, self.name())?;
         let conn = snapshot.connection();
 
-        let headers_by_id = load_composer_headers(conn)?;
-        let composer_rows = load_composer_rows(conn)?;
-        let bubbles_by_key = load_bubbles(conn)?;
-
-        let mut composer_ids = headers_by_id.keys().cloned().collect::<Vec<_>>();
-        for (composer_id, value) in &composer_rows {
-            if !composer_ids.iter().any(|existing| existing == composer_id)
-                && !extract_conversation_headers(value).is_empty()
-            {
-                composer_ids.push(composer_id.clone());
-            }
+        match cursor_state_db_kind(path).unwrap_or(CursorStateDbKind::Global) {
+            CursorStateDbKind::Global => parse_global_state_db(conn, self.name()),
+            CursorStateDbKind::Workspace => parse_workspace_state_db(conn, self.name()),
         }
-
-        let mut sessions = Vec::new();
-        for composer_id in composer_ids {
-            let header = headers_by_id.get(&composer_id).cloned().unwrap_or_default();
-            let payload = match composer_rows.get(&composer_id) {
-                Some(payload) => payload,
-                None => continue,
-            };
-
-            if let Some(session) = build_normalized_session(
-                self.name(),
-                &composer_id,
-                &header,
-                payload,
-                &bubbles_by_key,
-            ) {
-                sessions.push(session);
-            }
-        }
-
-        Ok(sessions)
     }
 
     fn fingerprint_paths(&self, path: &Path) -> Vec<PathBuf> {
@@ -145,19 +135,144 @@ impl SourceAdapter for CursorAdapter {
     }
 }
 
+impl CursorAdapter {
+    fn push_candidate_path(&self, paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+        if self.can_handle(&candidate) && !paths.iter().any(|path| path == &candidate) {
+            paths.push(candidate);
+        }
+    }
+
+    fn discover_workspace_state_dbs(
+        &self,
+        workspace_storage: &Path,
+        paths: &mut Vec<PathBuf>,
+    ) -> AppResult<()> {
+        if !workspace_storage.is_dir() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(workspace_storage)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            self.push_candidate_path(paths, entry.path().join("state.vscdb"));
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_global_state_db(conn: &Connection, source_app: &str) -> AppResult<Vec<NormalizedSession>> {
+    let headers_by_id = load_composer_headers(conn)?;
+    let composer_rows = load_composer_rows(conn)?;
+    let bubbles_by_key = load_bubbles(conn)?;
+
+    Ok(build_sessions_from_composer_rows(
+        source_app,
+        &headers_by_id,
+        &composer_rows,
+        &bubbles_by_key,
+        false,
+    ))
+}
+
+fn parse_workspace_state_db(
+    conn: &Connection,
+    source_app: &str,
+) -> AppResult<Vec<NormalizedSession>> {
+    let mut headers_by_id = load_composer_headers(conn)?;
+    headers_by_id.extend(load_workspace_composer_headers(conn)?);
+    let composer_rows = load_composer_rows(conn)?;
+    let bubbles_by_key = load_bubbles(conn)?;
+
+    Ok(build_sessions_from_composer_rows(
+        source_app,
+        &headers_by_id,
+        &composer_rows,
+        &bubbles_by_key,
+        true,
+    ))
+}
+
+fn build_sessions_from_composer_rows(
+    source_app: &str,
+    headers_by_id: &HashMap<String, CursorComposerHeader>,
+    composer_rows: &HashMap<String, Value>,
+    bubbles_by_key: &HashMap<(String, String), Value>,
+    include_metadata_only: bool,
+) -> Vec<NormalizedSession> {
+    let mut composer_ids = headers_by_id.keys().cloned().collect::<Vec<_>>();
+    for (composer_id, value) in composer_rows {
+        if !composer_ids.iter().any(|existing| existing == composer_id)
+            && !extract_conversation_headers(value).is_empty()
+        {
+            composer_ids.push(composer_id.clone());
+        }
+    }
+
+    let mut sessions = Vec::new();
+    for composer_id in composer_ids {
+        let header = headers_by_id.get(&composer_id).cloned().unwrap_or_default();
+        if let Some(payload) = composer_rows.get(&composer_id) {
+            if let Some(session) =
+                build_normalized_session(source_app, &composer_id, &header, payload, bubbles_by_key)
+            {
+                sessions.push(session);
+                continue;
+            }
+        }
+
+        if include_metadata_only {
+            if let Some(session) =
+                build_workspace_metadata_session(source_app, &composer_id, &header)
+            {
+                sessions.push(session);
+            }
+        }
+    }
+
+    sessions
+}
+
 fn load_composer_headers(conn: &Connection) -> AppResult<HashMap<String, CursorComposerHeader>> {
-    let raw_value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(raw_value) = raw_value else {
+    let Some(raw_value) = load_item_table_value(conn, "composer.composerHeaders")? else {
         return Ok(HashMap::new());
     };
 
     let payload: Value = serde_json::from_str(&raw_value)?;
+    Ok(extract_composer_headers(&payload))
+}
+
+fn load_workspace_composer_headers(
+    conn: &Connection,
+) -> AppResult<HashMap<String, CursorComposerHeader>> {
+    let Some(raw_value) = load_item_table_value(conn, "composer.composerData")? else {
+        return Ok(HashMap::new());
+    };
+
+    let payload: Value = serde_json::from_str(&raw_value)?;
+    Ok(extract_composer_headers(&payload))
+}
+
+fn load_item_table_value(conn: &Connection, key: &str) -> AppResult<Option<String>> {
+    if !table_exists(conn, "ItemTable")? {
+        return Ok(None);
+    }
+
+    let raw_value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ? LIMIT 1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    Ok(raw_value)
+}
+
+fn extract_composer_headers(payload: &Value) -> HashMap<String, CursorComposerHeader> {
     let mut headers = HashMap::new();
     let all_composers = payload
         .get("allComposers")
@@ -209,10 +324,14 @@ fn load_composer_headers(conn: &Connection) -> AppResult<HashMap<String, CursorC
         );
     }
 
-    Ok(headers)
+    headers
 }
 
 fn load_composer_rows(conn: &Connection) -> AppResult<HashMap<String, Value>> {
+    if !table_exists(conn, "cursorDiskKV")? {
+        return Ok(HashMap::new());
+    }
+
     let mut stmt =
         conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
     let rows = stmt.query_map([], |row| {
@@ -238,6 +357,10 @@ fn load_composer_rows(conn: &Connection) -> AppResult<HashMap<String, Value>> {
 }
 
 fn load_bubbles(conn: &Connection) -> AppResult<HashMap<(String, String), Value>> {
+    if !table_exists(conn, "cursorDiskKV")? {
+        return Ok(HashMap::new());
+    }
+
     let mut stmt =
         conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")?;
     let rows = stmt.query_map([], |row| {
@@ -263,6 +386,17 @@ fn load_bubbles(conn: &Connection) -> AppResult<HashMap<(String, String), Value>
     }
 
     Ok(grouped)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> AppResult<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            [table_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn build_normalized_session(
@@ -410,6 +544,76 @@ fn build_normalized_session(
         requests,
         events,
     })
+}
+
+fn build_workspace_metadata_session(
+    source_app: &str,
+    composer_id: &str,
+    header: &CursorComposerHeader,
+) -> Option<NormalizedSession> {
+    if header.title.is_none() {
+        return None;
+    }
+
+    let checksum_parts = [
+        "workspace-metadata",
+        composer_id,
+        header.title.as_deref().unwrap_or_default(),
+        &header
+            .created_at
+            .map(|value| value.timestamp_millis().to_string())
+            .unwrap_or_default(),
+        &header
+            .updated_at
+            .map(|value| value.timestamp_millis().to_string())
+            .unwrap_or_default(),
+    ];
+
+    Some(NormalizedSession {
+        source_app: source_app.to_string(),
+        external_session_id: Some(composer_id.to_string()),
+        session_key: format!("cursor:{composer_id}"),
+        title: header.title.clone(),
+        model_first: None,
+        model_last: None,
+        source_created_at: header.created_at,
+        source_updated_at: header.updated_at,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        message_count: 0,
+        conversation_checksum: hash::sha256_text(&checksum_parts.join("\n")),
+        requests: Vec::new(),
+        events: Vec::new(),
+    })
+}
+
+fn cursor_state_db_kind(path: &Path) -> Option<CursorStateDbKind> {
+    if !path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("state.vscdb"))
+    {
+        return None;
+    }
+
+    let parent_name = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())?;
+    if parent_name.eq_ignore_ascii_case("globalStorage") {
+        return Some(CursorStateDbKind::Global);
+    }
+
+    let grandparent_name = path
+        .parent()
+        .and_then(|value| value.parent())
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str());
+    if grandparent_name.is_some_and(|value| value.eq_ignore_ascii_case("workspaceStorage")) {
+        return Some(CursorStateDbKind::Workspace);
+    }
+
+    None
 }
 
 fn build_requests_messages_and_events(
@@ -1085,6 +1289,66 @@ mod tests {
         .expect("insert low confidence assistant bubble");
     }
 
+    fn write_workspace_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open workspace cursor fixture db");
+        conn.execute_batch(
+            "
+            CREATE TABLE ItemTable (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            ",
+        )
+        .expect("create workspace cursor schema");
+
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composer.composerData",
+                json!({
+                    "allComposers": [{
+                        "composerId": "cmp_workspace_1",
+                        "name": "Workspace Cursor Session",
+                        "createdAt": 1_747_465_749_805_i64,
+                        "lastUpdatedAt": 1_747_466_678_347_i64
+                    }],
+                    "selectedComposerIds": ["cmp_workspace_1"]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert workspace composer data");
+    }
+
+    fn write_untitled_workspace_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open untitled workspace cursor fixture db");
+        conn.execute_batch(
+            "
+            CREATE TABLE ItemTable (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            ",
+        )
+        .expect("create untitled workspace cursor schema");
+
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composer.composerData",
+                json!({
+                    "allComposers": [{
+                        "composerId": "cmp_workspace_untitled_1",
+                        "createdAt": 1_747_465_749_805_i64,
+                        "lastUpdatedAt": 1_747_466_678_347_i64
+                    }]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert untitled workspace composer data");
+    }
+
     #[test]
     fn cursor_discovers_state_db_from_directory_or_file_path() {
         let adapter = CursorAdapter;
@@ -1093,23 +1357,35 @@ mod tests {
             crate::utils::ids::new_uuid()
         ));
         let global_storage = root.join("globalStorage");
+        let workspace_storage = root.join("workspaceStorage").join("workspace_hash");
         fs::create_dir_all(&global_storage).expect("create temp cursor dir");
+        fs::create_dir_all(&workspace_storage).expect("create temp cursor workspace dir");
         let db_path = global_storage.join("state.vscdb");
+        let workspace_db_path = workspace_storage.join("state.vscdb");
         fs::write(&db_path, "").expect("write state db");
+        fs::write(&workspace_db_path, "").expect("write workspace state db");
 
         let from_dir = adapter
             .discover_paths(&global_storage)
             .expect("discover from globalStorage");
+        let from_user_dir = adapter
+            .discover_paths(&root)
+            .expect("discover from cursor user dir");
         let from_file = adapter
             .discover_paths(&db_path)
             .expect("discover from file");
 
         assert_eq!(from_dir, vec![db_path.clone()]);
+        assert_eq!(
+            from_user_dir,
+            vec![db_path.clone(), workspace_db_path.clone()]
+        );
         assert_eq!(from_file, vec![db_path.clone()]);
+        assert!(adapter.can_handle(&workspace_db_path));
 
         let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_dir(&global_storage);
-        let _ = fs::remove_dir(&root);
+        let _ = fs::remove_file(&workspace_db_path);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1201,5 +1477,51 @@ mod tests {
         assert!(session.events.is_empty());
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn cursor_parse_workspace_composer_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "totoken-cursor-workspace-{}",
+            crate::utils::ids::new_uuid()
+        ));
+        let workspace_dir = root.join("workspaceStorage").join("workspace_hash");
+        fs::create_dir_all(&workspace_dir).expect("create workspace fixture dir");
+        let db_path = workspace_dir.join("state.vscdb");
+        write_workspace_fixture_db(&db_path);
+
+        let sessions = CursorAdapter
+            .parse(&db_path)
+            .expect("parse workspace cursor fixture");
+
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.session_key, "cursor:cmp_workspace_1");
+        assert_eq!(session.title.as_deref(), Some("Workspace Cursor Session"));
+        assert_eq!(session.message_count, 0);
+        assert!(session.requests.is_empty());
+        assert!(session.events.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_parse_ignores_untitled_workspace_metadata_only_composers() {
+        let root = std::env::temp_dir().join(format!(
+            "totoken-cursor-workspace-untitled-{}",
+            crate::utils::ids::new_uuid()
+        ));
+        let workspace_dir = root.join("workspaceStorage").join("workspace_hash");
+        fs::create_dir_all(&workspace_dir).expect("create untitled workspace fixture dir");
+        let db_path = workspace_dir.join("state.vscdb");
+        write_untitled_workspace_fixture_db(&db_path);
+
+        let sessions = CursorAdapter
+            .parse(&db_path)
+            .expect("parse untitled workspace cursor fixture");
+
+        assert!(sessions.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

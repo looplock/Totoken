@@ -383,6 +383,89 @@ mod tests {
     }
 
     #[test]
+    fn cursor_workspace_empty_shell_sessions_are_hidden_from_session_lists() -> AppResult<()> {
+        let db_path = temp_db_path("cursor-workspace-empty-shell-session-list");
+        let pool = init_db_with_path(&db_path)?;
+        let conn = pool.get()?;
+        let now = Utc::now();
+
+        for (session_id, title, session_key) in [
+            ("session-empty-shell", None, "cursor:empty-shell"),
+            (
+                "session-real-global",
+                Some("Real Cursor Session"),
+                "cursor:real-global",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (
+                    id,
+                    source_app,
+                    external_session_id,
+                    session_key,
+                    title,
+                    model_first,
+                    model_last,
+                    source_created_at,
+                    source_updated_at,
+                    discovered_first_at,
+                    discovered_last_at,
+                    source_state
+                 ) VALUES (?1, 'cursor', ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, 'synced')",
+                params![
+                    session_id,
+                    session_key,
+                    session_key,
+                    title,
+                    now,
+                    now,
+                    now,
+                    now
+                ],
+            )?;
+        }
+
+        conn.execute(
+            "INSERT INTO session_source_refs (
+                session_id, source_path, source_file_id, last_linked_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "session-empty-shell",
+                "C:/Cursor/User/workspaceStorage/hash/state.vscdb",
+                "workspace-source-file",
+                now
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO session_source_refs (
+                session_id, source_path, source_file_id, last_linked_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "session-real-global",
+                "C:/Cursor/User/globalStorage/state.vscdb",
+                "global-source-file",
+                now
+            ],
+        )?;
+
+        let repository = Repository::new(pool.clone());
+        let response = repository.sessions_list(None)?;
+
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].id, "session-real-global");
+        assert_eq!(response.pagination.total_items, 1);
+        assert_eq!(response.facets.source_apps.len(), 1);
+        assert_eq!(response.facets.source_apps[0].value, "cursor");
+        assert_eq!(response.facets.source_apps[0].count, 1);
+
+        drop(conn);
+        drop(pool);
+        cleanup_temp_db(&db_path);
+
+        Ok(())
+    }
+
+    #[test]
     fn session_list_search_filter_sort_and_pagination_match_query() -> AppResult<()> {
         let db_path = temp_db_path("session-list-query");
         let pool = init_db_with_path(&db_path)?;

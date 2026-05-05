@@ -7,6 +7,30 @@ const SESSION_SOURCE_STATE_SQL: &str =
     "CASE s.source_state WHEN 'active' THEN 'synced' WHEN 'deleted_by_user' THEN 'deleted' ELSE s.source_state END";
 const SESSION_ESTIMATED_COST_SQL: &str =
     "(SELECT SUM(r.estimated_cost_usd) FROM session_requests r WHERE r.session_id = s.id)";
+const HIDE_CURSOR_WORKSPACE_EMPTY_SHELL_SQL: &str = "
+    NOT (
+        s.source_app = 'cursor'
+        AND NULLIF(TRIM(COALESCE(s.title, '')), '') IS NULL
+        AND EXISTS (
+            SELECT 1 FROM session_source_refs ref_workspace
+            WHERE ref_workspace.session_id = s.id
+              AND ref_workspace.source_path LIKE '%workspaceStorage%'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM session_source_refs ref_global
+            WHERE ref_global.session_id = s.id
+              AND ref_global.source_path LIKE '%globalStorage%'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM session_requests request_rows
+            WHERE request_rows.session_id = s.id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM session_token_totals totals
+            WHERE totals.session_id = s.id
+              AND COALESCE(totals.total_tokens_max, 0) > 0
+        )
+    )";
 
 impl Repository {
     pub fn sessions_list(&self, query: Option<SessionListQuery>) -> AppResult<SessionListResponse> {
@@ -160,6 +184,7 @@ fn build_session_where_clause(
     let mut clauses = vec![format!(
         "s.source_app IN ({SUPPORTED_SOURCE_APP_SQL_FILTER})"
     )];
+    clauses.push(HIDE_CURSOR_WORKSPACE_EMPTY_SHELL_SQL.to_string());
     let mut sql_params = Vec::new();
 
     if let Some(search) = query.q.as_deref() {
