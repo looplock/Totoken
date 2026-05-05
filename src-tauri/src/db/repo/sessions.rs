@@ -7,6 +7,44 @@ const SESSION_SOURCE_STATE_SQL: &str =
     "CASE s.source_state WHEN 'active' THEN 'synced' WHEN 'deleted_by_user' THEN 'deleted' ELSE s.source_state END";
 const SESSION_ESTIMATED_COST_SQL: &str =
     "(SELECT SUM(r.estimated_cost_usd) FROM session_requests r WHERE r.session_id = s.id)";
+const SESSION_LIST_INPUT_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.input_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.input_tokens, 0)), 0) FROM session_requests r WHERE r.session_id = s.id) END";
+const SESSION_LIST_OUTPUT_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.output_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.output_tokens, 0)), 0) FROM session_requests r WHERE r.session_id = s.id) END";
+const SESSION_LIST_TOTAL_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.total_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.total_tokens, COALESCE(r.input_tokens, 0) + COALESCE(r.output_tokens, 0) + COALESCE(r.cache_read_input_tokens, 0) + COALESCE(r.cache_write_input_tokens, 0))), 0) FROM session_requests r WHERE r.session_id = s.id) END";
+const HIDE_CURSOR_WORKSPACE_EMPTY_SHELL_SQL: &str = "
+    NOT (
+        s.source_app = 'cursor'
+        AND NULLIF(TRIM(COALESCE(s.title, '')), '') IS NULL
+        AND EXISTS (
+            SELECT 1 FROM session_source_refs ref_workspace
+            WHERE ref_workspace.session_id = s.id
+              AND ref_workspace.source_path LIKE '%workspaceStorage%'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM session_source_refs ref_global
+            WHERE ref_global.session_id = s.id
+              AND ref_global.source_path LIKE '%globalStorage%'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM session_requests request_rows
+            WHERE request_rows.session_id = s.id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM session_token_totals totals
+            WHERE totals.session_id = s.id
+              AND (
+                COALESCE(totals.total_tokens_max, 0) > 0
+                OR EXISTS (
+                    SELECT 1 FROM session_requests request_totals
+                    WHERE request_totals.session_id = s.id
+                      AND (
+                        COALESCE(request_totals.total_tokens, 0) > 0
+                        OR COALESCE(request_totals.input_tokens, 0) > 0
+                        OR COALESCE(request_totals.output_tokens, 0) > 0
+                      )
+                )
+              )
+        )
+    )";
 
 impl Repository {
     pub fn sessions_list(&self, query: Option<SessionListQuery>) -> AppResult<SessionListResponse> {
@@ -21,8 +59,7 @@ impl Repository {
         };
         let page = query.page.min(total_pages.max(1));
         let offset = (page - 1) * query.page_size;
-        let mut items = load_session_page(&conn, &query, query.page_size, offset)?;
-        apply_cursor_low_confidence_estimates_for_page(&conn, &mut items)?;
+        let items = load_session_page(&conn, &query, query.page_size, offset)?;
 
         Ok(SessionListResponse {
             items,
@@ -42,13 +79,6 @@ impl Repository {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CursorLowConfidenceEstimate {
-    input_tokens: i64,
-    output_tokens: i64,
-    total_tokens: i64,
-}
-
 fn load_session_page(
     conn: &rusqlite::Connection,
     query: &NormalizedSessionListQuery,
@@ -65,10 +95,10 @@ fn load_session_page(
             {SESSION_MODEL_SQL},
             {SESSION_LAST_UPDATED_SQL},
             {SESSION_SOURCE_STATE_SQL},
-            COALESCE(st.input_tokens_max, 0),
-            COALESCE(st.output_tokens_max, 0),
-            COALESCE(st.total_tokens_max, 0),
-            CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN 'high' ELSE NULL END,
+            {SESSION_LIST_INPUT_TOKENS_SQL},
+            {SESSION_LIST_OUTPUT_TOKENS_SQL},
+            {SESSION_LIST_TOTAL_TOKENS_SQL},
+            NULL,
             {SESSION_ESTIMATED_COST_SQL},
             COALESCE(obs.message_count, 0)
          FROM sessions s
@@ -160,6 +190,7 @@ fn build_session_where_clause(
     let mut clauses = vec![format!(
         "s.source_app IN ({SUPPORTED_SOURCE_APP_SQL_FILTER})"
     )];
+    clauses.push(HIDE_CURSOR_WORKSPACE_EMPTY_SHELL_SQL.to_string());
     let mut sql_params = Vec::new();
 
     if let Some(search) = query.q.as_deref() {
@@ -221,13 +252,13 @@ fn session_order_clause(query: &NormalizedSessionListQuery) -> String {
         "sourceApp" => format!("s.source_app {direction}, s.id {direction}"),
         "model" => format!("{SESSION_MODEL_SQL} {direction}, s.id {direction}"),
         "inputTokens" => {
-            format!("COALESCE(st.input_tokens_max, 0) {direction}, s.id {direction}")
+            format!("{SESSION_LIST_INPUT_TOKENS_SQL} {direction}, s.id {direction}")
         }
         "outputTokens" => {
-            format!("COALESCE(st.output_tokens_max, 0) {direction}, s.id {direction}")
+            format!("{SESSION_LIST_OUTPUT_TOKENS_SQL} {direction}, s.id {direction}")
         }
         "totalTokens" => {
-            format!("COALESCE(st.total_tokens_max, 0) {direction}, s.id {direction}")
+            format!("{SESSION_LIST_TOTAL_TOKENS_SQL} {direction}, s.id {direction}")
         }
         "estimatedCostUsd" if query.sort_order == "desc" => {
             format!(
@@ -257,87 +288,6 @@ fn map_session_list_item(row: &Row) -> rusqlite::Result<SessionListItem> {
         estimated_cost_usd: row.get(10)?,
         messages: row.get(11)?,
     })
-}
-
-fn apply_cursor_low_confidence_estimates_for_page(
-    conn: &rusqlite::Connection,
-    items: &mut [SessionListItem],
-) -> AppResult<()> {
-    let session_ids: Vec<String> = items
-        .iter()
-        .filter(|item| item.source_app == "cursor" && item.total_tokens == 0)
-        .map(|item| item.id.clone())
-        .collect();
-    if session_ids.is_empty() {
-        return Ok(());
-    }
-
-    let estimates = load_cursor_low_confidence_estimates(conn, &session_ids)?;
-    for item in items {
-        apply_cursor_low_confidence_estimate(item, &estimates);
-    }
-    Ok(())
-}
-
-fn load_cursor_low_confidence_estimates(
-    conn: &rusqlite::Connection,
-    session_ids: &[String],
-) -> AppResult<HashMap<String, CursorLowConfidenceEstimate>> {
-    let sql = format!(
-        "SELECT
-            session_id,
-            SUM(COALESCE(input_tokens, 0)),
-            SUM(COALESCE(output_tokens, 0)),
-            SUM(COALESCE(total_tokens, 0))
-         FROM session_requests
-         WHERE token_confidence = 'low'
-           AND session_id IN ({})
-         GROUP BY session_id
-         HAVING SUM(COALESCE(input_tokens, 0)) > 0
-             OR SUM(COALESCE(output_tokens, 0)) > 0",
-        sql_placeholders(session_ids.len())
-    );
-    let sql_params: Vec<rusqlite::types::Value> = session_ids
-        .iter()
-        .cloned()
-        .map(rusqlite::types::Value::Text)
-        .collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            CursorLowConfidenceEstimate {
-                input_tokens: row.get(1)?,
-                output_tokens: row.get(2)?,
-                total_tokens: row.get(3)?,
-            },
-        ))
-    })?;
-
-    let mut estimates = HashMap::new();
-    for row in rows {
-        let (session_id, estimate) = row?;
-        estimates.insert(session_id, estimate);
-    }
-    Ok(estimates)
-}
-
-fn apply_cursor_low_confidence_estimate(
-    item: &mut SessionListItem,
-    estimates: &HashMap<String, CursorLowConfidenceEstimate>,
-) {
-    if item.source_app != "cursor" || item.total_tokens != 0 {
-        return;
-    }
-
-    let Some(estimate) = estimates.get(&item.id) else {
-        return;
-    };
-
-    item.input_tokens = estimate.input_tokens;
-    item.output_tokens = estimate.output_tokens;
-    item.total_tokens = estimate.total_tokens;
-    item.token_confidence = Some("low".to_string());
 }
 
 fn normalize_session_list_query(

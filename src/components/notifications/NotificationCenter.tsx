@@ -403,6 +403,7 @@ export function NotificationCenter() {
           <IconButton
             className="notification-toast-close"
             label={t('notifications.dismiss')}
+            showTooltip={false}
             onClick={() => dismissNotice(notice.noticeKey)}
           >
             <X size={15} />

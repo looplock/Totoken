@@ -253,6 +253,9 @@ fn normalize_existing_item(
     if source_app == "kiro" && scan_paths.len() == 1 && scan_paths[0] == root_path {
         scan_paths = build_default_scan_paths_for_app(source_app, Path::new(&root_path));
     }
+    if source_app == "cursor" {
+        scan_paths = ensure_cursor_workspace_scan_path(scan_paths, Path::new(&root_path));
+    }
     let mut normalized = SourceSettingsItem {
         id: source_id_for_app(source_app),
         app: source_app.to_string(),
@@ -691,10 +694,13 @@ fn build_default_scan_paths_for_app(source_app: &str, root_path: &Path) -> Vec<S
             path_to_string(&root_path.join("sessions")),
             path_to_string(&root_path.join("archived_sessions")),
         ],
-        "cursor" => vec![path_to_string(&database_scan_path(
+        "cursor" => ensure_cursor_workspace_scan_path(
+            vec![path_to_string(&database_scan_path(
+                root_path,
+                "state.vscdb",
+            ))],
             root_path,
-            "state.vscdb",
-        ))],
+        ),
         "kilocode" => vec![path_to_string(&database_scan_path(root_path, "kilo.db"))],
         "kiro" => vec![path_to_string(&root_path.join("workspace-sessions"))],
         "opencode" => vec![path_to_string(root_path)],
@@ -755,6 +761,66 @@ fn database_scan_path(root_path: &Path, file_name: &str) -> PathBuf {
         Some(value) if value.eq_ignore_ascii_case(file_name) => root_path.to_path_buf(),
         _ => root_path.join(file_name),
     }
+}
+
+fn ensure_cursor_workspace_scan_path(mut scan_paths: Vec<String>, root_path: &Path) -> Vec<String> {
+    if let Some(workspace_path) = cursor_workspace_storage_path(root_path) {
+        let workspace_path = path_to_string(&workspace_path);
+        if !scan_paths.iter().any(|path| path == &workspace_path) {
+            scan_paths.push(workspace_path);
+        }
+    }
+
+    scan_paths
+}
+
+fn cursor_workspace_storage_path(root_path: &Path) -> Option<PathBuf> {
+    let file_name = root_path.file_name().and_then(|value| value.to_str())?;
+    if file_name.eq_ignore_ascii_case("workspaceStorage") {
+        return Some(root_path.to_path_buf());
+    }
+
+    if file_name.eq_ignore_ascii_case("globalStorage") {
+        return root_path
+            .parent()
+            .map(|parent| parent.join("workspaceStorage"));
+    }
+
+    if file_name.eq_ignore_ascii_case("state.vscdb") {
+        return root_path.parent().and_then(|parent| {
+            let parent_name = parent.file_name().and_then(|value| value.to_str())?;
+            if parent_name.eq_ignore_ascii_case("globalStorage") {
+                return parent
+                    .parent()
+                    .map(|user_dir| user_dir.join("workspaceStorage"));
+            }
+
+            parent
+                .parent()
+                .filter(|workspace_storage| {
+                    workspace_storage
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("workspaceStorage"))
+                })
+                .map(Path::to_path_buf)
+        });
+    }
+
+    if root_path
+        .parent()
+        .and_then(|parent| {
+            parent
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| value.eq_ignore_ascii_case("workspaceStorage"))
+        })
+        .is_some()
+    {
+        return root_path.parent().map(Path::to_path_buf);
+    }
+
+    Some(root_path.join("workspaceStorage"))
 }
 
 fn path_to_string(path: &Path) -> String {
@@ -837,7 +903,60 @@ mod tests {
 
         let paths = build_default_scan_paths_for_app("cursor", &root_path);
 
-        assert_eq!(paths, vec![path_to_string(&root_path.join("state.vscdb"))]);
+        assert_eq!(
+            paths,
+            vec![
+                path_to_string(&root_path.join("state.vscdb")),
+                path_to_string(
+                    &root_path
+                        .parent()
+                        .expect("cursor user dir")
+                        .join("workspaceStorage")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_workspace_hash_root_does_not_add_nested_workspace_storage() {
+        let workspace_storage = test_home_dir()
+            .join("AppData")
+            .join("Roaming")
+            .join("Cursor")
+            .join("User")
+            .join("workspaceStorage");
+        let workspace_hash = workspace_storage.join("abc123");
+
+        let paths = build_default_scan_paths_for_app("cursor", &workspace_hash);
+
+        assert_eq!(
+            paths,
+            vec![
+                path_to_string(&workspace_hash.join("state.vscdb")),
+                path_to_string(&workspace_storage),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_workspace_state_db_scan_path_maps_to_workspace_storage_root() {
+        let workspace_storage = test_home_dir()
+            .join("AppData")
+            .join("Roaming")
+            .join("Cursor")
+            .join("User")
+            .join("workspaceStorage");
+        let workspace_db = workspace_storage.join("abc123").join("state.vscdb");
+
+        let paths = build_default_scan_paths_for_app("cursor", &workspace_db);
+
+        assert_eq!(
+            paths,
+            vec![
+                path_to_string(&workspace_db),
+                path_to_string(&workspace_storage)
+            ]
+        );
     }
 
     #[test]

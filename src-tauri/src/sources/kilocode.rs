@@ -11,6 +11,8 @@ use crate::error::{AppError, AppResult};
 use crate::utils::sqlite::SqliteSnapshot;
 use crate::utils::{hash, time};
 
+// Supports the current Kilo Code VS Code extension runtime after its built-in
+// migration to Kilo/OpenCode SQLite storage.
 pub struct KilocodeAdapter;
 
 #[derive(Debug, Serialize, Deserialize)]

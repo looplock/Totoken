@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::message_stream::{MessageStreamAggregator, MessageStreamItem, MessageTokenUsage};
@@ -12,6 +13,12 @@ use crate::utils::sqlite::SqliteSnapshot;
 use crate::utils::{hash, time};
 
 pub struct CursorAdapter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorStateDbKind {
+    Global,
+    Workspace,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CursorLocator {
@@ -48,6 +55,7 @@ struct CursorParsedTurn {
     high_output_tokens: i64,
     estimated_input_tokens: Option<i64>,
     estimated_output_tokens: Option<i64>,
+    estimated_tool_result_tokens: Option<i64>,
     usage_event_id: Option<String>,
 }
 
@@ -57,18 +65,11 @@ impl SourceAdapter for CursorAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        2
+        5
     }
 
     fn can_handle(&self, path: &Path) -> bool {
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("state.vscdb"))
-            && path
-                .parent()
-                .and_then(|value| value.file_name())
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("globalStorage"))
+        cursor_state_db_kind(path).is_some()
     }
 
     fn discover_paths(&self, root_path: &Path) -> AppResult<Vec<PathBuf>> {
@@ -84,51 +85,41 @@ impl SourceAdapter for CursorAdapter {
                 .collect());
         }
 
-        let candidate = root_path.join("state.vscdb");
-        Ok(self
-            .can_handle(&candidate)
-            .then_some(candidate)
-            .into_iter()
-            .collect())
+        let mut paths = Vec::new();
+        self.push_candidate_path(&mut paths, root_path.join("state.vscdb"));
+        if !root_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("globalStorage"))
+        {
+            self.push_candidate_path(
+                &mut paths,
+                root_path.join("globalStorage").join("state.vscdb"),
+            );
+        }
+
+        let workspace_storage = if root_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("workspaceStorage"))
+        {
+            root_path.to_path_buf()
+        } else {
+            root_path.join("workspaceStorage")
+        };
+        self.discover_workspace_state_dbs(&workspace_storage, &mut paths)?;
+
+        Ok(paths)
     }
 
     fn parse(&self, path: &Path) -> AppResult<Vec<NormalizedSession>> {
         let snapshot = SqliteSnapshot::open(path, self.name())?;
         let conn = snapshot.connection();
 
-        let headers_by_id = load_composer_headers(conn)?;
-        let composer_rows = load_composer_rows(conn)?;
-        let bubbles_by_key = load_bubbles(conn)?;
-
-        let mut composer_ids = headers_by_id.keys().cloned().collect::<Vec<_>>();
-        for (composer_id, value) in &composer_rows {
-            if !composer_ids.iter().any(|existing| existing == composer_id)
-                && !extract_conversation_headers(value).is_empty()
-            {
-                composer_ids.push(composer_id.clone());
-            }
+        match cursor_state_db_kind(path).unwrap_or(CursorStateDbKind::Global) {
+            CursorStateDbKind::Global => parse_global_state_db(conn, self.name()),
+            CursorStateDbKind::Workspace => parse_workspace_state_db(conn, self.name()),
         }
-
-        let mut sessions = Vec::new();
-        for composer_id in composer_ids {
-            let header = headers_by_id.get(&composer_id).cloned().unwrap_or_default();
-            let payload = match composer_rows.get(&composer_id) {
-                Some(payload) => payload,
-                None => continue,
-            };
-
-            if let Some(session) = build_normalized_session(
-                self.name(),
-                &composer_id,
-                &header,
-                payload,
-                &bubbles_by_key,
-            ) {
-                sessions.push(session);
-            }
-        }
-
-        Ok(sessions)
     }
 
     fn fingerprint_paths(&self, path: &Path) -> Vec<PathBuf> {
@@ -145,19 +136,149 @@ impl SourceAdapter for CursorAdapter {
     }
 }
 
+impl CursorAdapter {
+    fn push_candidate_path(&self, paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+        if candidate.is_file()
+            && self.can_handle(&candidate)
+            && !paths.iter().any(|path| path == &candidate)
+        {
+            paths.push(candidate);
+        }
+    }
+
+    fn discover_workspace_state_dbs(
+        &self,
+        workspace_storage: &Path,
+        paths: &mut Vec<PathBuf>,
+    ) -> AppResult<()> {
+        if !workspace_storage.is_dir() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(workspace_storage)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            self.push_candidate_path(paths, entry.path().join("state.vscdb"));
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_global_state_db(conn: &Connection, source_app: &str) -> AppResult<Vec<NormalizedSession>> {
+    let headers_by_id = load_composer_headers(conn)?;
+    let composer_rows = load_composer_rows(conn)?;
+    let bubble_keys = collect_referenced_bubble_keys(&composer_rows);
+    let bubbles_by_key = load_bubbles(conn, &bubble_keys)?;
+
+    Ok(build_sessions_from_composer_rows(
+        source_app,
+        &headers_by_id,
+        &composer_rows,
+        &bubbles_by_key,
+        false,
+    ))
+}
+
+fn parse_workspace_state_db(
+    conn: &Connection,
+    source_app: &str,
+) -> AppResult<Vec<NormalizedSession>> {
+    let mut headers_by_id = load_composer_headers(conn)?;
+    headers_by_id.extend(load_workspace_composer_headers(conn)?);
+    let composer_rows = load_composer_rows(conn)?;
+    let bubble_keys = collect_referenced_bubble_keys(&composer_rows);
+    let bubbles_by_key = load_bubbles(conn, &bubble_keys)?;
+
+    Ok(build_sessions_from_composer_rows(
+        source_app,
+        &headers_by_id,
+        &composer_rows,
+        &bubbles_by_key,
+        true,
+    ))
+}
+
+fn build_sessions_from_composer_rows(
+    source_app: &str,
+    headers_by_id: &HashMap<String, CursorComposerHeader>,
+    composer_rows: &HashMap<String, Value>,
+    bubbles_by_key: &HashMap<(String, String), Value>,
+    include_metadata_only: bool,
+) -> Vec<NormalizedSession> {
+    let mut composer_ids = headers_by_id.keys().cloned().collect::<Vec<_>>();
+    for (composer_id, value) in composer_rows {
+        if !composer_ids.iter().any(|existing| existing == composer_id)
+            && !extract_conversation_headers(value).is_empty()
+        {
+            composer_ids.push(composer_id.clone());
+        }
+    }
+
+    let mut sessions = Vec::new();
+    for composer_id in composer_ids {
+        let header = headers_by_id.get(&composer_id).cloned().unwrap_or_default();
+        if let Some(payload) = composer_rows.get(&composer_id) {
+            if let Some(session) =
+                build_normalized_session(source_app, &composer_id, &header, payload, bubbles_by_key)
+            {
+                sessions.push(session);
+                continue;
+            }
+        }
+
+        if include_metadata_only {
+            if let Some(session) =
+                build_workspace_metadata_session(source_app, &composer_id, &header)
+            {
+                sessions.push(session);
+            }
+        }
+    }
+
+    sessions
+}
+
 fn load_composer_headers(conn: &Connection) -> AppResult<HashMap<String, CursorComposerHeader>> {
-    let raw_value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders' LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(raw_value) = raw_value else {
+    let Some(raw_value) = load_item_table_value(conn, "composer.composerHeaders")? else {
         return Ok(HashMap::new());
     };
 
     let payload: Value = serde_json::from_str(&raw_value)?;
+    Ok(extract_composer_headers(&payload))
+}
+
+fn load_workspace_composer_headers(
+    conn: &Connection,
+) -> AppResult<HashMap<String, CursorComposerHeader>> {
+    let Some(raw_value) = load_item_table_value(conn, "composer.composerData")? else {
+        return Ok(HashMap::new());
+    };
+
+    let payload: Value = serde_json::from_str(&raw_value)?;
+    Ok(extract_composer_headers(&payload))
+}
+
+fn load_item_table_value(conn: &Connection, key: &str) -> AppResult<Option<String>> {
+    if !table_exists(conn, "ItemTable")? {
+        return Ok(None);
+    }
+
+    let raw_value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ? LIMIT 1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    Ok(raw_value)
+}
+
+fn extract_composer_headers(payload: &Value) -> HashMap<String, CursorComposerHeader> {
     let mut headers = HashMap::new();
     let all_composers = payload
         .get("allComposers")
@@ -209,10 +330,14 @@ fn load_composer_headers(conn: &Connection) -> AppResult<HashMap<String, CursorC
         );
     }
 
-    Ok(headers)
+    headers
 }
 
 fn load_composer_rows(conn: &Connection) -> AppResult<HashMap<String, Value>> {
+    if !table_exists(conn, "cursorDiskKV")? {
+        return Ok(HashMap::new());
+    }
+
     let mut stmt =
         conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")?;
     let rows = stmt.query_map([], |row| {
@@ -237,32 +362,71 @@ fn load_composer_rows(conn: &Connection) -> AppResult<HashMap<String, Value>> {
     Ok(grouped)
 }
 
-fn load_bubbles(conn: &Connection) -> AppResult<HashMap<(String, String), Value>> {
-    let mut stmt =
-        conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
+fn collect_referenced_bubble_keys(composer_rows: &HashMap<String, Value>) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for (composer_id, payload) in composer_rows {
+        for bubble_header in extract_conversation_headers(payload) {
+            keys.insert(format!(
+                "bubbleId:{composer_id}:{}",
+                bubble_header.bubble_id
+            ));
+        }
+    }
+    keys
+}
+
+fn load_bubbles(
+    conn: &Connection,
+    bubble_keys: &HashSet<String>,
+) -> AppResult<HashMap<(String, String), Value>> {
+    if !table_exists(conn, "cursorDiskKV")? {
+        return Ok(HashMap::new());
+    }
+    if bubble_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
 
     let mut grouped = HashMap::new();
-    for row in rows {
-        let (key, value) = row?;
-        let Some(value) = value else {
-            continue;
-        };
-        let Some(rest) = key.strip_prefix("bubbleId:") else {
-            continue;
-        };
-        let Some((composer_id, bubble_id)) = rest.split_once(':') else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<Value>(&value) else {
-            continue;
-        };
-        grouped.insert((composer_id.to_string(), bubble_id.to_string()), payload);
+    let bubble_keys = bubble_keys.iter().collect::<Vec<_>>();
+    for chunk in bubble_keys.chunks(500) {
+        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(chunk.iter().map(|value| value.as_str())),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+
+        for row in rows {
+            let (key, value) = row?;
+            let Some(value) = value else {
+                continue;
+            };
+            let Some(rest) = key.strip_prefix("bubbleId:") else {
+                continue;
+            };
+            let Some((composer_id, bubble_id)) = rest.split_once(':') else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(&value) else {
+                continue;
+            };
+            grouped.insert((composer_id.to_string(), bubble_id.to_string()), payload);
+        }
     }
 
     Ok(grouped)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> AppResult<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            [table_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn build_normalized_session(
@@ -297,6 +461,7 @@ fn build_normalized_session(
     });
 
     let mut checksum_parts = vec![
+        "cursor-estimates-as-session-totals-v1".to_string(),
         composer_id.to_string(),
         session_model.clone().unwrap_or_default(),
         title.clone().unwrap_or_default(),
@@ -339,6 +504,14 @@ fn build_normalized_session(
         checksum_parts.push(message.character_count.unwrap_or(0).to_string());
         checksum_parts.push(message.high_input_tokens.to_string());
         checksum_parts.push(message.high_output_tokens.to_string());
+        checksum_parts.push(message.estimated_input_tokens.unwrap_or(0).to_string());
+        checksum_parts.push(message.estimated_output_tokens.unwrap_or(0).to_string());
+        checksum_parts.push(
+            message
+                .estimated_tool_result_tokens
+                .unwrap_or(0)
+                .to_string(),
+        );
         checksum_parts.push(
             bubble_payload
                 .get("text")
@@ -356,7 +529,7 @@ fn build_normalized_session(
 
     let message_count = parsed_messages.len() as i64;
     let fallback_event_time = source_updated_at.or(source_created_at);
-    let (mut requests, mut events, total_input_tokens, total_output_tokens) =
+    let (mut requests, events, total_input_tokens, total_output_tokens) =
         build_requests_messages_and_events(
             parsed_messages,
             fallback_event_time,
@@ -377,23 +550,6 @@ fn build_normalized_session(
         .or(session_model);
     let conversation_checksum = hash::sha256_text(&checksum_parts.join("\n"));
 
-    if events.is_empty() && (total_input_tokens > 0 || total_output_tokens > 0) {
-        if let Some(event_time_utc) = fallback_event_time {
-            events.push(NormalizedUsageEvent {
-                event_time_utc,
-                model: model_last.clone(),
-                delta_input: total_input_tokens,
-                delta_output: total_output_tokens,
-                delta_total: total_input_tokens + total_output_tokens,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-                source_event_id: Some(composer_id.to_string()),
-                granularity: "session_total".to_string(),
-                confidence: "low".to_string(),
-            });
-        }
-    }
-
     Some(NormalizedSession {
         source_app: source_app.to_string(),
         external_session_id: Some(composer_id.to_string()),
@@ -410,6 +566,74 @@ fn build_normalized_session(
         requests,
         events,
     })
+}
+
+fn build_workspace_metadata_session(
+    source_app: &str,
+    composer_id: &str,
+    header: &CursorComposerHeader,
+) -> Option<NormalizedSession> {
+    header.title.as_ref()?;
+
+    let checksum_parts = [
+        "workspace-metadata",
+        composer_id,
+        header.title.as_deref().unwrap_or_default(),
+        &header
+            .created_at
+            .map(|value| value.timestamp_millis().to_string())
+            .unwrap_or_default(),
+        &header
+            .updated_at
+            .map(|value| value.timestamp_millis().to_string())
+            .unwrap_or_default(),
+    ];
+
+    Some(NormalizedSession {
+        source_app: source_app.to_string(),
+        external_session_id: Some(composer_id.to_string()),
+        session_key: format!("cursor:{composer_id}"),
+        title: header.title.clone(),
+        model_first: None,
+        model_last: None,
+        source_created_at: header.created_at,
+        source_updated_at: header.updated_at,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        message_count: 0,
+        conversation_checksum: hash::sha256_text(&checksum_parts.join("\n")),
+        requests: Vec::new(),
+        events: Vec::new(),
+    })
+}
+
+fn cursor_state_db_kind(path: &Path) -> Option<CursorStateDbKind> {
+    if !path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("state.vscdb"))
+    {
+        return None;
+    }
+
+    let parent_name = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())?;
+    if parent_name.eq_ignore_ascii_case("globalStorage") {
+        return Some(CursorStateDbKind::Global);
+    }
+
+    let grandparent_name = path
+        .parent()
+        .and_then(|value| value.parent())
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str());
+    if grandparent_name.is_some_and(|value| value.eq_ignore_ascii_case("workspaceStorage")) {
+        return Some(CursorStateDbKind::Workspace);
+    }
+
+    None
 }
 
 fn build_requests_messages_and_events(
@@ -460,13 +684,15 @@ fn build_requests_messages_and_events(
     let aggregate = MessageStreamAggregator::new(stream_items)
         .aggregate_sequential_user_requests("cursor-request");
     let mut requests = aggregate.requests;
-    apply_cursor_low_confidence_estimates(&mut requests, &estimates_by_request_id);
+    apply_cursor_estimates(&mut requests, &estimates_by_request_id);
+    let (total_input_tokens, total_output_tokens) = cursor_request_token_totals(&requests)
+        .unwrap_or((aggregate.total_input_tokens, aggregate.total_output_tokens));
 
     (
         requests,
         aggregate.events,
-        aggregate.total_input_tokens,
-        aggregate.total_output_tokens,
+        total_input_tokens,
+        total_output_tokens,
     )
 }
 
@@ -482,6 +708,8 @@ fn build_cursor_request_estimates(
     let mut estimates = HashMap::<String, CursorRequestEstimate>::new();
     let mut current_request_id: Option<String> = None;
     let mut generated_sequence_no = 0_i64;
+    let mut rolling_context_tokens = 0_i64;
+    let mut pending_model_input = false;
 
     for message in parsed_messages {
         if message.role == "user" || current_request_id.is_none() {
@@ -497,14 +725,37 @@ fn build_cursor_request_estimates(
             continue;
         };
         let estimate = estimates.entry(request_id.clone()).or_default();
-        estimate.input_tokens += message.estimated_input_tokens.unwrap_or(0);
-        estimate.output_tokens += message.estimated_output_tokens.unwrap_or(0);
+        match message.role.as_str() {
+            "user" => {
+                rolling_context_tokens += message.estimated_input_tokens.unwrap_or(0);
+                pending_model_input = true;
+            }
+            "assistant" => {
+                if pending_model_input && rolling_context_tokens > 0 {
+                    estimate.input_tokens += rolling_context_tokens;
+                    pending_model_input = false;
+                }
+                let output_tokens = message.estimated_output_tokens.unwrap_or(0);
+                estimate.output_tokens += output_tokens;
+                rolling_context_tokens += output_tokens;
+            }
+            "tool" => {
+                let tool_call_tokens = message.estimated_output_tokens.unwrap_or(0);
+                let tool_result_tokens = message.estimated_tool_result_tokens.unwrap_or(0);
+                estimate.output_tokens += tool_call_tokens;
+                rolling_context_tokens += tool_call_tokens + tool_result_tokens;
+                if tool_result_tokens > 0 {
+                    pending_model_input = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     estimates
 }
 
-fn apply_cursor_low_confidence_estimates(
+fn apply_cursor_estimates(
     requests: &mut [NormalizedRequest],
     estimates_by_request_id: &HashMap<String, CursorRequestEstimate>,
 ) {
@@ -528,8 +779,19 @@ fn apply_cursor_low_confidence_estimates(
         request.total_tokens = Some(estimate.input_tokens + estimate.output_tokens);
         request.cache_read_input_tokens = Some(0);
         request.cache_write_input_tokens = Some(0);
-        request.token_confidence = Some("low".to_string());
     }
+}
+
+fn cursor_request_token_totals(requests: &[NormalizedRequest]) -> Option<(i64, i64)> {
+    let mut input_tokens = 0_i64;
+    let mut output_tokens = 0_i64;
+
+    for request in requests {
+        input_tokens += request.input_tokens.unwrap_or(0);
+        output_tokens += request.output_tokens.unwrap_or(0);
+    }
+
+    (input_tokens > 0 || output_tokens > 0).then_some((input_tokens, output_tokens))
 }
 
 fn parse_bubble(
@@ -585,45 +847,55 @@ fn parse_bubble(
     let high_input_tokens = if input_tokens > 0 { input_tokens } else { 0 };
     let high_output_tokens = if output_tokens > 0 { output_tokens } else { 0 };
 
-    let (role, message_type, estimated_input_tokens, estimated_output_tokens, character_count) =
-        if bubble_header.bubble_type == 1 {
-            let character_count = text.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "user".to_string(),
-                "message".to_string(),
-                text.as_deref().map(estimate_text_tokens),
-                None,
-                character_count,
-            )
-        } else if capability_type == Some(30) {
-            let character_count = text.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "assistant".to_string(),
-                "thinking".to_string(),
-                None,
-                text.as_deref().map(estimate_text_tokens),
-                character_count,
-            )
-        } else if capability_type == Some(15) || tool_name.is_some() {
-            let summary = build_tool_summary(tool_name.as_deref(), tool_status.as_deref());
-            let character_count = summary.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "tool".to_string(),
-                "tool".to_string(),
-                None,
-                None,
-                character_count,
-            )
-        } else {
-            let character_count = text.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "assistant".to_string(),
-                "message".to_string(),
-                None,
-                text.as_deref().map(estimate_text_tokens),
-                character_count,
-            )
-        };
+    let (
+        role,
+        message_type,
+        estimated_input_tokens,
+        estimated_output_tokens,
+        estimated_tool_result_tokens,
+        character_count,
+    ) = if bubble_header.bubble_type == 1 {
+        let character_count = text.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "user".to_string(),
+            "message".to_string(),
+            text.as_deref().map(estimate_text_tokens),
+            None,
+            None,
+            character_count,
+        )
+    } else if capability_type == Some(30) {
+        let character_count = text.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "assistant".to_string(),
+            "thinking".to_string(),
+            None,
+            text.as_deref().map(estimate_text_tokens),
+            None,
+            character_count,
+        )
+    } else if capability_type == Some(15) || tool_name.is_some() {
+        let summary = build_tool_summary(tool_name.as_deref(), tool_status.as_deref());
+        let character_count = summary.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "tool".to_string(),
+            "tool".to_string(),
+            None,
+            estimate_tool_call_tokens(bubble_payload),
+            estimate_tool_result_tokens(bubble_payload),
+            character_count,
+        )
+    } else {
+        let character_count = text.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "assistant".to_string(),
+            "message".to_string(),
+            None,
+            text.as_deref().map(estimate_text_tokens),
+            None,
+            character_count,
+        )
+    };
 
     CursorParsedTurn {
         source_message_id: bubble_header.bubble_id.clone(),
@@ -638,6 +910,7 @@ fn parse_bubble(
         high_output_tokens,
         estimated_input_tokens,
         estimated_output_tokens,
+        estimated_tool_result_tokens,
         usage_event_id: bubble_payload
             .get("usageUuid")
             .and_then(Value::as_str)
@@ -649,6 +922,47 @@ fn parse_bubble(
                     .and_then(|value| normalize_optional_text(Some(value)))
             }),
     }
+}
+
+fn estimate_tool_call_tokens(bubble_payload: &Value) -> Option<i64> {
+    let tool_data = bubble_payload.get("toolFormerData")?;
+    max_estimated_tokens([
+        estimate_string_value_tokens(tool_data.get("rawArgs")),
+        estimate_string_value_tokens(tool_data.get("params")),
+    ])
+}
+
+fn estimate_tool_result_tokens(bubble_payload: &Value) -> Option<i64> {
+    let tool_data = bubble_payload.get("toolFormerData")?;
+    max_estimated_tokens([
+        estimate_string_value_tokens(tool_data.get("result")),
+        estimate_json_value_tokens(tool_data.get("additionalData")),
+    ])
+}
+
+fn estimate_string_value_tokens(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|value| normalize_optional_text(Some(value)))
+        .map(|value| estimate_text_tokens(&value))
+}
+
+fn estimate_json_value_tokens(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+
+    let serialized = serde_json::to_string(value).ok()?;
+    normalize_optional_text(Some(&serialized)).map(|value| estimate_text_tokens(&value))
+}
+
+fn max_estimated_tokens(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    values
+        .into_iter()
+        .flatten()
+        .max()
+        .filter(|value| *value > 0)
 }
 
 fn extract_conversation_headers(payload: &Value) -> Vec<CursorBubbleHeader> {
@@ -998,8 +1312,8 @@ mod tests {
         .expect("insert assistant bubble");
     }
 
-    fn write_low_confidence_fixture_db(path: &Path) {
-        let conn = Connection::open(path).expect("open low confidence fixture db");
+    fn write_estimated_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open estimated fixture db");
         conn.execute_batch(
             "
             CREATE TABLE ItemTable (
@@ -1012,7 +1326,7 @@ mod tests {
             );
             ",
         )
-        .expect("create low confidence cursor schema");
+        .expect("create estimated cursor schema");
 
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
@@ -1020,8 +1334,8 @@ mod tests {
                 "composer.composerHeaders",
                 json!({
                     "allComposers": [{
-                        "composerId": "cmp_low_1",
-                        "name": "Cursor Low Session",
+                        "composerId": "cmp_estimated_1",
+                        "name": "Cursor Estimated Session",
                         "createdAt": 1_747_465_749_805_i64,
                         "lastUpdatedAt": 1_747_466_678_347_i64
                     }]
@@ -1029,15 +1343,15 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence composer headers");
+        .expect("insert estimated composer headers");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "composerData:cmp_low_1",
+                "composerData:cmp_estimated_1",
                 json!({
                     "_v": 1,
-                    "composerId": "cmp_low_1",
+                    "composerId": "cmp_estimated_1",
                     "status": "completed",
                     "fullConversationHeadersOnly": [
                         { "bubbleId": "bubble_user_1", "type": 1, "grouping": { "isRenderable": true } },
@@ -1047,12 +1361,12 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence composer");
+        .expect("insert estimated composer");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "bubbleId:cmp_low_1:bubble_user_1",
+                "bubbleId:cmp_estimated_1:bubble_user_1",
                 json!({
                     "bubbleId": "bubble_user_1",
                     "type": 1,
@@ -1062,12 +1376,12 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence user bubble");
+        .expect("insert estimated user bubble");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "bubbleId:cmp_low_1:bubble_assistant_1",
+                "bubbleId:cmp_estimated_1:bubble_assistant_1",
                 json!({
                     "bubbleId": "bubble_assistant_1",
                     "type": 2,
@@ -1082,7 +1396,176 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence assistant bubble");
+        .expect("insert estimated assistant bubble");
+    }
+
+    fn write_estimated_tool_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open estimated tool fixture db");
+        conn.execute_batch(
+            "
+            CREATE TABLE ItemTable (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            CREATE TABLE cursorDiskKV (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            ",
+        )
+        .expect("create estimated tool cursor schema");
+
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composer.composerHeaders",
+                json!({
+                    "allComposers": [{
+                        "composerId": "cmp_estimated_tool_1",
+                        "name": "Cursor Tool Session",
+                        "createdAt": 1_747_465_749_805_i64,
+                        "lastUpdatedAt": 1_747_466_678_347_i64
+                    }]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert estimated tool composer headers");
+
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composerData:cmp_estimated_tool_1",
+                json!({
+                    "_v": 1,
+                    "composerId": "cmp_estimated_tool_1",
+                    "status": "completed",
+                    "fullConversationHeadersOnly": [
+                        { "bubbleId": "bubble_user_1", "type": 1, "grouping": { "isRenderable": true } },
+                        { "bubbleId": "bubble_assistant_1", "type": 2, "grouping": { "isRenderable": true } },
+                        { "bubbleId": "bubble_tool_1", "type": 2, "capabilityType": 15, "grouping": { "isRenderable": true } },
+                        { "bubbleId": "bubble_assistant_2", "type": 2, "grouping": { "isRenderable": true } }
+                    ]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert estimated tool composer");
+
+        for (bubble_id, payload) in [
+            (
+                "bubble_user_1",
+                json!({
+                    "bubbleId": "bubble_user_1",
+                    "type": 1,
+                    "text": "abcd",
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+            (
+                "bubble_assistant_1",
+                json!({
+                    "bubbleId": "bubble_assistant_1",
+                    "type": 2,
+                    "text": "efgh",
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+            (
+                "bubble_tool_1",
+                json!({
+                    "bubbleId": "bubble_tool_1",
+                    "type": 2,
+                    "capabilityType": 15,
+                    "text": "",
+                    "toolFormerData": {
+                        "name": "read_file",
+                        "status": "completed",
+                        "rawArgs": "ijkl",
+                        "result": "r".repeat(120)
+                    },
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+            (
+                "bubble_assistant_2",
+                json!({
+                    "bubbleId": "bubble_assistant_2",
+                    "type": 2,
+                    "text": "mnop",
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("bubbleId:cmp_estimated_tool_1:{bubble_id}"),
+                    payload.to_string()
+                ],
+            )
+            .expect("insert estimated tool bubble");
+        }
+    }
+
+    fn write_workspace_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open workspace cursor fixture db");
+        conn.execute_batch(
+            "
+            CREATE TABLE ItemTable (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            ",
+        )
+        .expect("create workspace cursor schema");
+
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composer.composerData",
+                json!({
+                    "allComposers": [{
+                        "composerId": "cmp_workspace_1",
+                        "name": "Workspace Cursor Session",
+                        "createdAt": 1_747_465_749_805_i64,
+                        "lastUpdatedAt": 1_747_466_678_347_i64
+                    }],
+                    "selectedComposerIds": ["cmp_workspace_1"]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert workspace composer data");
+    }
+
+    fn write_untitled_workspace_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open untitled workspace cursor fixture db");
+        conn.execute_batch(
+            "
+            CREATE TABLE ItemTable (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            ",
+        )
+        .expect("create untitled workspace cursor schema");
+
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composer.composerData",
+                json!({
+                    "allComposers": [{
+                        "composerId": "cmp_workspace_untitled_1",
+                        "createdAt": 1_747_465_749_805_i64,
+                        "lastUpdatedAt": 1_747_466_678_347_i64
+                    }]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert untitled workspace composer data");
     }
 
     #[test]
@@ -1093,23 +1576,39 @@ mod tests {
             crate::utils::ids::new_uuid()
         ));
         let global_storage = root.join("globalStorage");
+        let workspace_storage = root.join("workspaceStorage").join("workspace_hash");
+        let stale_workspace_storage = root.join("workspaceStorage").join("stale_hash");
+        let nested_global_storage = root.join("workspaceStorage").join("globalStorage");
         fs::create_dir_all(&global_storage).expect("create temp cursor dir");
+        fs::create_dir_all(&workspace_storage).expect("create temp cursor workspace dir");
+        fs::create_dir_all(&stale_workspace_storage).expect("create stale workspace dir");
+        fs::create_dir_all(&nested_global_storage).expect("create nested globalStorage dir");
         let db_path = global_storage.join("state.vscdb");
+        let workspace_db_path = workspace_storage.join("state.vscdb");
         fs::write(&db_path, "").expect("write state db");
+        fs::write(&workspace_db_path, "").expect("write workspace state db");
 
         let from_dir = adapter
             .discover_paths(&global_storage)
             .expect("discover from globalStorage");
+        let from_user_dir = adapter
+            .discover_paths(&root)
+            .expect("discover from cursor user dir");
         let from_file = adapter
             .discover_paths(&db_path)
             .expect("discover from file");
 
         assert_eq!(from_dir, vec![db_path.clone()]);
+        assert_eq!(
+            from_user_dir,
+            vec![db_path.clone(), workspace_db_path.clone()]
+        );
         assert_eq!(from_file, vec![db_path.clone()]);
+        assert!(adapter.can_handle(&workspace_db_path));
 
         let _ = fs::remove_file(&db_path);
-        let _ = fs::remove_dir(&global_storage);
-        let _ = fs::remove_dir(&root);
+        let _ = fs::remove_file(&workspace_db_path);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1182,24 +1681,145 @@ mod tests {
     }
 
     #[test]
-    fn cursor_low_confidence_estimates_stay_out_of_session_aggregates() {
-        let db_path = unique_temp_db_path("low-confidence");
-        write_low_confidence_fixture_db(&db_path);
+    fn cursor_estimates_feed_session_aggregates() {
+        let db_path = unique_temp_db_path("estimated");
+        write_estimated_fixture_db(&db_path);
 
         let sessions = CursorAdapter
             .parse(&db_path)
-            .expect("parse low confidence cursor fixture");
+            .expect("parse estimated cursor fixture");
 
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
         assert_eq!(session.requests.len(), 1);
-        assert_eq!(session.requests[0].token_confidence.as_deref(), Some("low"));
+        assert_eq!(session.requests[0].token_confidence, None);
         assert!(session.requests[0].input_tokens.unwrap_or(0) > 0);
         assert!(session.requests[0].output_tokens.unwrap_or(0) > 0);
-        assert_eq!(session.total_input_tokens, 0);
-        assert_eq!(session.total_output_tokens, 0);
+        assert_eq!(
+            session.total_input_tokens,
+            session.requests[0].input_tokens.unwrap_or(0)
+        );
+        assert_eq!(
+            session.total_output_tokens,
+            session.requests[0].output_tokens.unwrap_or(0)
+        );
         assert!(session.events.is_empty());
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn cursor_estimates_include_tool_results_as_follow_up_context() {
+        let db_path = unique_temp_db_path("estimated-tool");
+        write_estimated_tool_fixture_db(&db_path);
+
+        let sessions = CursorAdapter
+            .parse(&db_path)
+            .expect("parse estimated cursor tool fixture");
+
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.requests.len(), 1);
+        let request = &session.requests[0];
+        assert_eq!(request.token_confidence, None);
+        assert_eq!(request.input_tokens, Some(34));
+        assert_eq!(request.output_tokens, Some(3));
+        assert_eq!(request.total_tokens, Some(37));
+        assert_eq!(session.total_input_tokens, 34);
+        assert_eq!(session.total_output_tokens, 3);
+        assert!(session.events.is_empty());
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn cursor_estimate_checksum_changes_with_tool_result_estimates() {
+        let db_path = unique_temp_db_path("estimated-tool-checksum");
+        write_estimated_tool_fixture_db(&db_path);
+
+        let initial = CursorAdapter
+            .parse(&db_path)
+            .expect("parse initial estimated cursor tool fixture");
+        assert_eq!(initial[0].requests[0].input_tokens, Some(34));
+
+        let conn = Connection::open(&db_path).expect("open estimated tool checksum db");
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                json!({
+                    "bubbleId": "bubble_tool_1",
+                    "type": 2,
+                    "capabilityType": 15,
+                    "text": "",
+                    "toolFormerData": {
+                        "name": "read_file",
+                        "status": "completed",
+                        "rawArgs": "ijkl",
+                        "result": "r".repeat(240)
+                    },
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                })
+                .to_string(),
+                "bubbleId:cmp_estimated_tool_1:bubble_tool_1"
+            ],
+        )
+        .expect("update estimated tool result");
+
+        let updated = CursorAdapter
+            .parse(&db_path)
+            .expect("parse updated estimated cursor tool fixture");
+        assert_ne!(
+            initial[0].conversation_checksum,
+            updated[0].conversation_checksum
+        );
+        assert_eq!(updated[0].requests[0].input_tokens, Some(64));
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn cursor_parse_workspace_composer_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "totoken-cursor-workspace-{}",
+            crate::utils::ids::new_uuid()
+        ));
+        let workspace_dir = root.join("workspaceStorage").join("workspace_hash");
+        fs::create_dir_all(&workspace_dir).expect("create workspace fixture dir");
+        let db_path = workspace_dir.join("state.vscdb");
+        write_workspace_fixture_db(&db_path);
+
+        let sessions = CursorAdapter
+            .parse(&db_path)
+            .expect("parse workspace cursor fixture");
+
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.session_key, "cursor:cmp_workspace_1");
+        assert_eq!(session.title.as_deref(), Some("Workspace Cursor Session"));
+        assert_eq!(session.message_count, 0);
+        assert!(session.requests.is_empty());
+        assert!(session.events.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cursor_parse_ignores_untitled_workspace_metadata_only_composers() {
+        let root = std::env::temp_dir().join(format!(
+            "totoken-cursor-workspace-untitled-{}",
+            crate::utils::ids::new_uuid()
+        ));
+        let workspace_dir = root.join("workspaceStorage").join("workspace_hash");
+        fs::create_dir_all(&workspace_dir).expect("create untitled workspace fixture dir");
+        let db_path = workspace_dir.join("state.vscdb");
+        write_untitled_workspace_fixture_db(&db_path);
+
+        let sessions = CursorAdapter
+            .parse(&db_path)
+            .expect("parse untitled workspace cursor fixture");
+
+        assert!(sessions.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

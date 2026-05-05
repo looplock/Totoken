@@ -57,6 +57,17 @@ pub async fn start_scan(
     let started_root_path_for_scan = started_root_path.clone();
     let scan_result = run_blocking(move || {
         let _scan_guard = state.try_acquire_scan_lock()?;
+        let scanner = state.scanner();
+        if !configured_source_targets_have_scannable_data(
+            &app_for_scan,
+            &scanner,
+            &state.source_settings_store(),
+            &requested_source_app_for_scan,
+            &trimmed,
+        )? {
+            return Ok(None);
+        }
+
         let scan_started_at = Utc::now();
         state.mark_scan_started("manual", &started_root_path_for_scan);
         events::emit_scan_started(
@@ -65,7 +76,6 @@ pub async fn start_scan(
             Some(&requested_source_app_for_scan),
             &started_root_path_for_scan,
         );
-        let scanner = state.scanner();
         let result = scan_configured_source_targets(
             &app_for_scan,
             &scanner,
@@ -86,7 +96,7 @@ pub async fn start_scan(
                     Some(&requested_source_app_for_scan),
                     &summary,
                 );
-                Ok(summary)
+                Ok(Some(summary))
             }
             Err(error) => {
                 state.mark_scan_failed(
@@ -112,6 +122,31 @@ pub async fn start_scan(
         Ok(_) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn configured_source_targets_have_scannable_data(
+    app: &tauri::AppHandle,
+    scanner: &Scanner,
+    source_settings_store: &source_settings::SourceSettingsStore,
+    source_app: &str,
+    fallback_path: &str,
+) -> AppResult<bool> {
+    let configured_targets =
+        source_settings::list_scannable_sources_for_app(app, source_settings_store, source_app)?;
+    if configured_targets.is_empty() {
+        return scanner.has_scannable_data(PathBuf::from(fallback_path), source_app);
+    }
+
+    for target in configured_targets {
+        if !target.path.exists() {
+            continue;
+        }
+        if scanner.has_scannable_data(target.path, source_app)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn scan_configured_source_targets(

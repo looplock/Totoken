@@ -266,6 +266,13 @@ impl Scanner {
         result
     }
 
+    pub fn has_scannable_data(&self, root_path: PathBuf, source_app: &str) -> AppResult<bool> {
+        let source_adapter = self
+            .adapter_for_source_app(source_app)
+            .ok_or_else(|| AppError::validation("Unsupported source adapter for scan"))?;
+        source_adapter.has_scannable_data(&root_path)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_source_file(
         &self,
@@ -301,28 +308,15 @@ impl Scanner {
             )
             .optional()?;
 
+        let mut force_rebuild_message_index = false;
         let cache_id = if let Some((cache_id, cached_fast, cached_parser_version)) = existing_cache
         {
             if cached_fast == fast_fingerprint.fast && cached_parser_version == parser_version {
                 *files_skipped += 1;
                 return Ok(());
             }
+            force_rebuild_message_index = true;
 
-            let file_fingerprint = match fingerprint::fingerprint_files(&fingerprint_paths) {
-                Ok(file_fingerprint) => file_fingerprint,
-                Err(error) => {
-                    *files_failed += 1;
-                    *error_count += 1;
-                    self.record_source_file_failure(
-                        &tx,
-                        abs_path,
-                        parser_version,
-                        &error.to_string(),
-                    )?;
-                    tx.commit()?;
-                    return Ok(());
-                }
-            };
             tx.execute(
                 "UPDATE source_files_cache
                  SET size_bytes = ?, mtime_ms = ?, fingerprint_fast = ?, fingerprint_strong = ?,
@@ -330,31 +324,16 @@ impl Scanner {
                      last_scan_at = CURRENT_TIMESTAMP, last_parse_status = NULL, last_error = NULL
                  WHERE id = ?",
                 params![
-                    file_fingerprint.size_bytes,
-                    file_fingerprint.mtime_ms,
-                    file_fingerprint.fast,
-                    file_fingerprint.strong,
+                    fast_fingerprint.size_bytes,
+                    fast_fingerprint.mtime_ms,
+                    fast_fingerprint.fast,
+                    Option::<String>::None,
                     parser_version,
                     cache_id
                 ],
             )?;
             cache_id
         } else {
-            let file_fingerprint = match fingerprint::fingerprint_files(&fingerprint_paths) {
-                Ok(file_fingerprint) => file_fingerprint,
-                Err(error) => {
-                    *files_failed += 1;
-                    *error_count += 1;
-                    self.record_source_file_failure(
-                        &tx,
-                        abs_path,
-                        parser_version,
-                        &error.to_string(),
-                    )?;
-                    tx.commit()?;
-                    return Ok(());
-                }
-            };
             let cache_id = ids::new_uuid();
             tx.execute(
                 "INSERT INTO source_files_cache (id, abs_path, size_bytes, mtime_ms, fingerprint_fast, fingerprint_strong, parser_version, last_scan_at)
@@ -362,10 +341,10 @@ impl Scanner {
                 params![
                     cache_id,
                     abs_path,
-                    file_fingerprint.size_bytes,
-                    file_fingerprint.mtime_ms,
-                    file_fingerprint.fast,
-                    file_fingerprint.strong,
+                    fast_fingerprint.size_bytes,
+                    fast_fingerprint.mtime_ms,
+                    fast_fingerprint.fast,
+                    Option::<String>::None,
                     parser_version
                 ],
             )?;
@@ -384,7 +363,7 @@ impl Scanner {
                         abs_path,
                         &cache_id,
                         scan_run_id,
-                        false,
+                        force_rebuild_message_index,
                     ) {
                         Ok(changed) => {
                             if changed {
@@ -588,9 +567,23 @@ impl Scanner {
                 .flatten(),
             None => None,
         };
+        let preserve_existing_model_last = should_preserve_existing_model_last(&session);
+        let effective_model_last = if preserve_existing_model_last {
+            existing_session
+                .as_ref()
+                .and_then(|existing| existing.model_last.clone())
+                .or_else(|| session.model_last.clone())
+        } else {
+            session.model_last.clone()
+        };
         let metadata_changed = match existing_session.as_ref() {
             Some(existing) => {
-                let merged = preview_session_merge(existing, &session, source_state);
+                let merged = preview_session_merge(
+                    existing,
+                    &session,
+                    source_state,
+                    effective_model_last.clone(),
+                );
                 session_metadata_changed(existing, &merged)
                     || existing_source_file_id.as_deref() != Some(source_file_id)
             }
@@ -628,7 +621,7 @@ impl Scanner {
                 session.session_key,
                 session.title,
                 session.model_first,
-                session.model_last,
+                effective_model_last,
                 session.source_created_at,
                 session.source_updated_at,
                 source_state
@@ -657,7 +650,7 @@ impl Scanner {
             .optional()?;
         let inserted_observation = existing_observation_id.is_none();
         let observation_id = existing_observation_id.unwrap_or_else(ids::new_uuid);
-        let session_total_tokens = normalized_session_total_tokens(&session);
+        let session_token_totals = normalized_session_token_totals(&session);
         tx.execute(
             "INSERT INTO session_observations (
                 id, session_id, input_tokens, output_tokens, total_tokens,
@@ -674,9 +667,9 @@ impl Scanner {
             params![
                 observation_id,
                 session_id,
-                session.total_input_tokens,
-                session.total_output_tokens,
-                session_total_tokens,
+                session_token_totals.input_tokens,
+                session_token_totals.output_tokens,
+                session_token_totals.total_tokens,
                 session.conversation_checksum,
                 session.message_count,
                 session.model_last,
@@ -684,7 +677,14 @@ impl Scanner {
             ],
         )?;
 
-        let should_rebuild_request_index = inserted_observation || force_rebuild_message_index;
+        let has_request_index_payload = !session.requests.is_empty() || !session.events.is_empty();
+        let should_rebuild_request_index =
+            has_request_index_payload && (inserted_observation || force_rebuild_message_index);
+        let has_session_usage_payload = has_request_index_payload
+            || session.total_input_tokens > 0
+            || session.total_output_tokens > 0;
+        let should_update_token_totals =
+            has_session_usage_payload && (inserted_observation || force_rebuild_message_index);
 
         if should_rebuild_request_index {
             tx.execute(
@@ -697,7 +697,7 @@ impl Scanner {
                     params![session_id],
                 )?;
             }
-        } else {
+        } else if !should_update_token_totals {
             return Ok(metadata_changed);
         }
 
@@ -759,7 +759,7 @@ impl Scanner {
             )?;
         }
 
-        if inserted_observation || force_rebuild_message_index {
+        if should_rebuild_request_index {
             for event in session.events {
                 let event_id = ids::new_uuid();
                 let event_estimated_cost_usd = estimate_usage_cost(
@@ -798,7 +798,9 @@ impl Scanner {
                     ],
                 )?;
             }
+        }
 
+        if should_update_token_totals {
             tx.execute(
                 "INSERT INTO session_token_totals (session_id, input_tokens_max, output_tokens_max, total_tokens_max, last_observed_at, last_observation_id)
                  VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
@@ -810,9 +812,9 @@ impl Scanner {
                     last_observation_id = excluded.last_observation_id",
                 params![
                     session_id,
-                    session.total_input_tokens,
-                    session.total_output_tokens,
-                    session_total_tokens,
+                    session_token_totals.input_tokens,
+                    session_token_totals.output_tokens,
+                    session_token_totals.total_tokens,
                     observation_id
                 ],
             )?;
@@ -835,14 +837,22 @@ fn should_drop_scan_run(summary: &ScanSummary, status: &str) -> bool {
         && summary.error_count == 0
 }
 
-fn normalized_session_total_tokens(session: &NormalizedSession) -> i64 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NormalizedSessionTokenTotals {
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+}
+
+fn normalized_session_token_totals(session: &NormalizedSession) -> NormalizedSessionTokenTotals {
+    let mut request_input_tokens = 0_i64;
+    let mut request_output_tokens = 0_i64;
     let request_total_tokens: i64 = session
         .requests
         .iter()
-        .filter(|request| {
-            session.source_app != "cursor" || request.token_confidence.as_deref() == Some("high")
-        })
         .map(|request| {
+            request_input_tokens += request.input_tokens.unwrap_or(0);
+            request_output_tokens += request.output_tokens.unwrap_or(0);
             request.total_tokens.unwrap_or(
                 request.input_tokens.unwrap_or(0)
                     + request.output_tokens.unwrap_or(0)
@@ -853,9 +863,17 @@ fn normalized_session_total_tokens(session: &NormalizedSession) -> i64 {
         .sum();
 
     if request_total_tokens > 0 {
-        request_total_tokens
+        NormalizedSessionTokenTotals {
+            input_tokens: request_input_tokens,
+            output_tokens: request_output_tokens,
+            total_tokens: request_total_tokens,
+        }
     } else {
-        session.total_input_tokens + session.total_output_tokens
+        NormalizedSessionTokenTotals {
+            input_tokens: session.total_input_tokens,
+            output_tokens: session.total_output_tokens,
+            total_tokens: session.total_input_tokens + session.total_output_tokens,
+        }
     }
 }
 
@@ -863,6 +881,7 @@ fn preview_session_merge(
     existing: &ExistingSessionRecord,
     session: &NormalizedSession,
     source_state: &str,
+    effective_model_last: Option<String>,
 ) -> SessionMergePreview {
     SessionMergePreview {
         external_session_id: existing
@@ -874,11 +893,20 @@ fn preview_session_merge(
             .model_first
             .clone()
             .or_else(|| session.model_first.clone()),
-        model_last: session.model_last.clone(),
+        model_last: effective_model_last,
         source_created_at: older_timestamp(existing.source_created_at, session.source_created_at),
         source_updated_at: newer_timestamp(existing.source_updated_at, session.source_updated_at),
         source_state: source_state.to_string(),
     }
+}
+
+fn should_preserve_existing_model_last(session: &NormalizedSession) -> bool {
+    session.source_app == "cursor"
+        && session.model_last.is_none()
+        && session.requests.is_empty()
+        && session.events.is_empty()
+        && session.total_input_tokens == 0
+        && session.total_output_tokens == 0
 }
 
 fn session_metadata_changed(
@@ -939,8 +967,49 @@ fn is_archived_source_path(source_app: &str, source_path: &str) -> bool {
 mod tests {
     use super::Scanner;
     use crate::db::init_db_with_path;
-    use crate::sources::{NormalizedRequest, NormalizedSession};
+    use crate::error::AppResult;
+    use crate::sources::{NormalizedRequest, NormalizedSession, SourceAdapter};
     use chrono::Utc;
+    use std::path::Path;
+
+    struct EmptyFileAdapter;
+
+    impl SourceAdapter for EmptyFileAdapter {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn can_handle(&self, path: &Path) -> bool {
+            path.is_file()
+        }
+
+        fn parse(&self, _path: &Path) -> AppResult<Vec<NormalizedSession>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct FixedSessionAdapter {
+        session: NormalizedSession,
+        parser_version: i64,
+    }
+
+    impl SourceAdapter for FixedSessionAdapter {
+        fn name(&self) -> &str {
+            "kiro"
+        }
+
+        fn parser_version(&self) -> i64 {
+            self.parser_version
+        }
+
+        fn can_handle(&self, path: &Path) -> bool {
+            path.is_file()
+        }
+
+        fn parse(&self, _path: &Path) -> AppResult<Vec<NormalizedSession>> {
+            Ok(vec![self.session.clone()])
+        }
+    }
 
     fn make_session(
         session_key: &str,
@@ -990,6 +1059,172 @@ mod tests {
             source_updated_at: None,
             source_locator: format!("request-{sequence_no}"),
         }
+    }
+
+    #[test]
+    fn source_cache_uses_fast_fingerprint_without_strong_file_hash() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-fast-fingerprint-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let source_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-fast-source-{}.txt",
+            crate::utils::ids::new_uuid()
+        ));
+        std::fs::write(&source_path, "source").expect("write source file");
+        let pool = init_db_with_path(&db_path).expect("init test db");
+        let scanner = Scanner::new(pool.clone());
+        let adapter = EmptyFileAdapter;
+        let abs_path = source_path.to_string_lossy().to_string();
+        let mut files_parsed = 0;
+        let mut files_skipped = 0;
+        let mut files_failed = 0;
+        let mut sessions_changed = 0;
+        let mut error_count = 0;
+
+        scanner
+            .process_source_file(
+                &adapter,
+                &source_path,
+                &abs_path,
+                None,
+                &mut files_parsed,
+                &mut files_skipped,
+                &mut files_failed,
+                &mut sessions_changed,
+                &mut error_count,
+            )
+            .expect("process source file");
+
+        let conn = pool.get().expect("load db conn");
+        let (fingerprint_fast, fingerprint_strong): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT fingerprint_fast, fingerprint_strong FROM source_files_cache WHERE abs_path = ?",
+                rusqlite::params![abs_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load source cache");
+        assert!(fingerprint_fast.is_some());
+        assert_eq!(fingerprint_strong, None);
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn parser_version_reparse_rebuilds_existing_session_token_totals() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-parser-rebuild-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let source_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-parser-rebuild-source-{}.json",
+            crate::utils::ids::new_uuid()
+        ));
+        std::fs::write(&source_path, r#"{"history":[]}"#).expect("write source file");
+        let pool = init_db_with_path(&db_path).expect("init test db");
+        let conn = pool.get().expect("load db conn");
+        let now = Utc::now();
+        let session_id = "session-parser-rebuild";
+        let observation_id = "observation-parser-rebuild";
+        let source_file_id = "source-file-parser-rebuild";
+        let source_path_text = source_path.to_string_lossy().to_string();
+
+        conn.execute(
+            "INSERT INTO sessions (
+                id, source_app, external_session_id, session_key, title,
+                model_first, model_last, source_created_at, source_updated_at,
+                discovered_first_at, discovered_last_at, source_state
+             ) VALUES (?1, 'kiro', 'external-parser-rebuild', 'kiro:parser-rebuild',
+                'Parser rebuild', 'claude-sonnet-4', 'claude-sonnet-4',
+                ?2, ?2, ?2, ?2, 'synced')",
+            rusqlite::params![session_id, now],
+        )
+        .expect("insert existing session");
+        conn.execute(
+            "INSERT INTO session_observations (
+                id, session_id, observed_at, input_tokens, output_tokens, total_tokens,
+                conversation_checksum, message_count, source_model, scan_run_id
+             ) VALUES (?1, ?2, ?3, 0, 0, 0, 'checksum-parser-rebuild', 2,
+                'claude-sonnet-4', 'scan-run-old')",
+            rusqlite::params![observation_id, session_id, now],
+        )
+        .expect("insert existing observation");
+        conn.execute(
+            "INSERT INTO session_token_totals (
+                session_id, input_tokens_max, output_tokens_max, total_tokens_max,
+                last_observed_at, last_observation_id
+             ) VALUES (?1, 0, 0, 0, ?2, ?3)",
+            rusqlite::params![session_id, now, observation_id],
+        )
+        .expect("insert stale token totals");
+        conn.execute(
+            "INSERT INTO source_files_cache (
+                id, abs_path, size_bytes, mtime_ms, fingerprint_fast, fingerprint_strong,
+                parser_version, last_scan_at, last_parse_status
+             ) VALUES (?1, ?2, 1, 1, 'stale-fast-fingerprint', NULL, 1, ?3, 'parsed')",
+            rusqlite::params![source_file_id, source_path_text, now],
+        )
+        .expect("insert stale source cache");
+        drop(conn);
+
+        let mut session = make_session("kiro:parser-rebuild", "checksum-parser-rebuild", 0, 0);
+        session.message_count = 2;
+        session.requests = vec![make_request(1, 120, 340, 460, 0)];
+        let adapter = FixedSessionAdapter {
+            session,
+            parser_version: 2,
+        };
+        let scanner = Scanner::new(pool.clone());
+        let mut files_parsed = 0;
+        let mut files_skipped = 0;
+        let mut files_failed = 0;
+        let mut sessions_changed = 0;
+        let mut error_count = 0;
+
+        scanner
+            .process_source_file(
+                &adapter,
+                &source_path,
+                &source_path_text,
+                None,
+                &mut files_parsed,
+                &mut files_skipped,
+                &mut files_failed,
+                &mut sessions_changed,
+                &mut error_count,
+            )
+            .expect("process source file");
+
+        let conn = pool.get().expect("load db conn");
+        let totals = conn
+            .query_row(
+                "SELECT input_tokens_max, output_tokens_max, total_tokens_max
+                 FROM session_token_totals WHERE session_id = ?",
+                rusqlite::params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("load rebuilt totals");
+        assert_eq!(totals, (120, 340, 460));
+        assert_eq!(files_parsed, 1);
+        assert_eq!(files_skipped, 0);
+        assert_eq!(files_failed, 0);
+        assert_eq!(error_count, 0);
+
+        let _ = std::fs::remove_file(&source_path);
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 
     #[test]
@@ -1171,9 +1406,9 @@ mod tests {
     }
 
     #[test]
-    fn cursor_low_confidence_requests_do_not_feed_session_totals() {
+    fn cursor_estimated_requests_feed_session_totals() {
         let db_path = std::env::temp_dir().join(format!(
-            "totoken-scanner-cursor-low-{}.db",
+            "totoken-scanner-cursor-estimated-{}.db",
             crate::utils::ids::new_uuid()
         ));
         let pool = init_db_with_path(&db_path).expect("init test db");
@@ -1182,9 +1417,9 @@ mod tests {
         let now = Utc::now();
         let session = NormalizedSession {
             source_app: "cursor".to_string(),
-            external_session_id: Some("cursor-low".to_string()),
-            session_key: "cursor:low".to_string(),
-            title: Some("Cursor Low".to_string()),
+            external_session_id: Some("cursor-estimated".to_string()),
+            session_key: "cursor:estimated".to_string(),
+            title: Some("Cursor Estimated".to_string()),
             model_first: Some("gpt-4.1".to_string()),
             model_last: Some("gpt-4.1".to_string()),
             source_created_at: Some(now),
@@ -1192,9 +1427,9 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             message_count: 2,
-            conversation_checksum: "cursor-low-checksum".to_string(),
+            conversation_checksum: "cursor-estimated-checksum".to_string(),
             requests: vec![NormalizedRequest {
-                source_request_id: Some("cursor:low:request-1".to_string()),
+                source_request_id: Some("cursor:estimated:request-1".to_string()),
                 sequence_no: 1,
                 status: Some("completed".to_string()),
                 message_count: 2,
@@ -1204,17 +1439,17 @@ mod tests {
                 total_tokens: Some(460),
                 cache_read_input_tokens: Some(0),
                 cache_write_input_tokens: Some(0),
-                token_confidence: Some("low".to_string()),
+                token_confidence: None,
                 source_created_at: Some(now),
                 source_updated_at: Some(now),
-                source_locator: "cursor-low-request".to_string(),
+                source_locator: "cursor-estimated-request".to_string(),
             }],
             events: Vec::new(),
         };
 
         scanner
             .upsert_normalized_session(session, "C:/Cursor/state.vscdb", "source-file-1", false)
-            .expect("insert low confidence cursor session");
+            .expect("insert estimated cursor session");
 
         let conn = pool.get().expect("load db conn");
         let totals = conn
@@ -1231,7 +1466,7 @@ mod tests {
                 },
             )
             .expect("load totals");
-        assert_eq!(totals, (0, 0, 0));
+        assert_eq!(totals, (120, 340, 460));
 
         let observation_totals = conn
             .query_row(
@@ -1247,7 +1482,202 @@ mod tests {
                 },
             )
             .expect("load observation totals");
-        assert_eq!(observation_totals, (0, 0, 0));
+        assert_eq!(observation_totals, (120, 340, 460));
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn kiro_estimated_requests_feed_session_totals() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-kiro-estimated-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let pool = init_db_with_path(&db_path).expect("init test db");
+        let scanner = Scanner::new(pool.clone());
+
+        let now = Utc::now();
+        let mut session = make_session("kiro:estimated", "kiro-estimated-checksum", 0, 0);
+        session.message_count = 2;
+        session.requests = vec![NormalizedRequest {
+            source_request_id: Some("kiro-estimated-request-1".to_string()),
+            sequence_no: 1,
+            status: Some("completed".to_string()),
+            message_count: 2,
+            model: Some("claude-sonnet-4.5".to_string()),
+            input_tokens: Some(120),
+            output_tokens: Some(340),
+            total_tokens: Some(460),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            token_confidence: Some("low".to_string()),
+            source_created_at: Some(now),
+            source_updated_at: Some(now),
+            source_locator: "kiro-low-request".to_string(),
+        }];
+
+        scanner
+            .upsert_normalized_session(
+                session,
+                "C:/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/demo/session.json",
+                "source-file-1",
+                false,
+            )
+            .expect("insert estimated kiro session");
+
+        let conn = pool.get().expect("load db conn");
+        let totals = conn
+            .query_row(
+                "SELECT input_tokens_max, output_tokens_max, total_tokens_max
+                 FROM session_token_totals",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("load totals");
+        assert_eq!(totals, (120, 340, 460));
+
+        let request_totals = conn
+            .query_row(
+                "SELECT input_tokens, output_tokens, total_tokens, token_confidence
+                 FROM session_requests",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .expect("load request totals");
+        assert_eq!(
+            request_totals,
+            (Some(120), Some(340), Some(460), Some("low".to_string()))
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn cursor_workspace_metadata_does_not_clear_global_request_index() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-cursor-workspace-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let pool = init_db_with_path(&db_path).expect("init test db");
+        let scanner = Scanner::new(pool.clone());
+
+        let now = Utc::now();
+        let mut global_session = make_session("cursor:shared", "global-checksum", 100, 30);
+        global_session.source_app = "cursor".to_string();
+        global_session.external_session_id = Some("shared".to_string());
+        global_session.title = Some("Global Cursor Session".to_string());
+        global_session.model_first = Some("gpt-4.1".to_string());
+        global_session.model_last = Some("gpt-4.1".to_string());
+        global_session.message_count = 2;
+        global_session.requests = vec![NormalizedRequest {
+            source_request_id: Some("request-1".to_string()),
+            sequence_no: 1,
+            status: Some("completed".to_string()),
+            message_count: 2,
+            model: Some("gpt-4.1".to_string()),
+            input_tokens: Some(100),
+            output_tokens: Some(30),
+            total_tokens: Some(130),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            token_confidence: Some("high".to_string()),
+            source_created_at: Some(now),
+            source_updated_at: Some(now),
+            source_locator: "global-request".to_string(),
+        }];
+
+        scanner
+            .upsert_normalized_session(
+                global_session,
+                "C:/Cursor/User/globalStorage/state.vscdb",
+                "global-source-file",
+                false,
+            )
+            .expect("insert global cursor session");
+
+        let mut workspace_session = make_session("cursor:shared", "workspace-checksum", 0, 0);
+        workspace_session.source_app = "cursor".to_string();
+        workspace_session.external_session_id = Some("shared".to_string());
+        workspace_session.title = Some("Workspace Cursor Session".to_string());
+        workspace_session.model_first = None;
+        workspace_session.model_last = None;
+        workspace_session.message_count = 0;
+        workspace_session.requests = Vec::new();
+        workspace_session.events = Vec::new();
+
+        scanner
+            .upsert_normalized_session(
+                workspace_session,
+                "C:/Cursor/User/workspaceStorage/hash/state.vscdb",
+                "workspace-source-file",
+                false,
+            )
+            .expect("insert workspace cursor metadata");
+
+        let conn = pool.get().expect("load db conn");
+        let request_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_requests", [], |row| {
+                row.get(0)
+            })
+            .expect("count requests");
+        assert_eq!(request_count, 1);
+
+        let totals = conn
+            .query_row(
+                "SELECT input_tokens_max, output_tokens_max, total_tokens_max
+                 FROM session_token_totals",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("load totals");
+        assert_eq!(totals, (100, 30, 130));
+
+        let source_ref_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_source_refs", [], |row| {
+                row.get(0)
+            })
+            .expect("count source refs");
+        assert_eq!(source_ref_count, 2);
+
+        let models = conn
+            .query_row(
+                "SELECT model_first, model_last FROM sessions WHERE session_key = ?",
+                rusqlite::params!["cursor:shared"],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .expect("load cursor models");
+        assert_eq!(
+            models,
+            (Some("gpt-4.1".to_string()), Some("gpt-4.1".to_string()))
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));

@@ -62,6 +62,9 @@ pub trait SourceAdapter {
     }
     fn can_handle(&self, path: &Path) -> bool;
     fn parse(&self, path: &Path) -> AppResult<Vec<NormalizedSession>>;
+    fn has_scannable_data(&self, root_path: &Path) -> AppResult<bool> {
+        Ok(!self.discover_paths(root_path)?.is_empty())
+    }
     fn discover_paths(&self, root_path: &Path) -> AppResult<Vec<PathBuf>> {
         let mut paths = Vec::new();
         for entry in WalkDir::new(root_path).into_iter().filter_map(Result::ok) {

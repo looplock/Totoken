@@ -39,7 +39,7 @@ Totoken 是本地桌面应用。普通用户不需要安装 Node.js、pnpm、Rus
 ## 功能
 
 - 用量仪表盘：查看 Token 总量、费用估算、扫描状态和近期活动。
-- 来源管理：支持 Claude Code、Codex、Cursor、OpenCode、Kilo Code 和 Kiro。
+- 来源管理：支持 Claude Code、Codex、Cursor、OpenCode、当前 Kilo Code VS Code 插件和 Kiro。
 - 会话与消息视图：浏览本地 AI 工具历史记录。
 - 统计视图：查看 Token 趋势、来源分布、模型用量、活动热力图和费用估算。
 - 模型目录：从 OpenRouter 同步模型元数据、上下文窗口、能力和价格信息。

@@ -5,6 +5,7 @@ type IconButtonProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children' 
   label: string;
   tooltip?: ReactNode;
   tooltipAlign?: 'start' | 'center' | 'end';
+  showTooltip?: boolean;
   children: ReactNode;
 };
 
@@ -12,6 +13,7 @@ export function IconButton({
   label,
   tooltip,
   tooltipAlign = 'center',
+  showTooltip = true,
   type = 'button',
   children,
   ...buttonProps
@@ -21,6 +23,10 @@ export function IconButton({
       {children}
     </button>
   );
+
+  if (!showTooltip) {
+    return button;
+  }
 
   return (
     <Tooltip content={tooltip ?? label} align={tooltipAlign}>

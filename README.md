@@ -39,7 +39,7 @@ Totoken is a local desktop app. End users do not need Node.js, pnpm, Rust, or th
 ## Features
 
 - Usage dashboard with token totals, estimated cost, scan status, and recent activity.
-- Source management for Claude Code, Codex, Cursor, OpenCode, Kilo Code, and Kiro.
+- Source management for Claude Code, Codex, Cursor, OpenCode, the current Kilo Code VS Code extension, and Kiro.
 - Session and message views for browsing local AI tool history.
 - Statistics views for token trends, source distribution, model usage, activity heatmaps, and cost estimates.
 - Model catalog sync from OpenRouter, including metadata, context windows, capabilities, and pricing.

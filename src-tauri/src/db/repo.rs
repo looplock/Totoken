@@ -7,8 +7,9 @@ use crate::models::{
     MessageUsageEventItem, ScanRecordsListQuery, ScanRecordsListResponse, ScanRunListItem,
     SessionFacetItem, SessionFacets, SessionListItem, SessionListPagination, SessionListQuery,
     SessionListResponse, SessionListSummary, StatisticsActivity, StatisticsActivityMetric,
-    StatisticsDetailRow, StatisticsDistributionRow, StatisticsMetricValue, StatisticsOverview,
-    StatisticsQuery, StatisticsRange, StatisticsSummary, StatisticsTrend,
+    StatisticsCostMetricValue, StatisticsDetailRow, StatisticsDistributionRow,
+    StatisticsMetricValue, StatisticsOverview, StatisticsQuery, StatisticsRange, StatisticsSummary,
+    StatisticsTrend,
 };
 use crate::pricing::{estimate_usage_cost, ModelPricing};
 use chrono::{
@@ -96,6 +97,7 @@ struct StatisticsSummaryAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
+    estimated_cost_usd: f64,
     sessions: BTreeSet<String>,
     models: BTreeSet<String>,
 }
@@ -176,7 +178,9 @@ fn normalize_source_state(value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::statistics::{build_statistics_activity, build_statistics_distribution};
+    use super::statistics::{
+        build_statistics_activity, build_statistics_distribution, build_statistics_summary,
+    };
     use super::*;
     use crate::db::init_db_with_path;
     use chrono::{Duration, Utc};
@@ -186,13 +190,13 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn cursor_low_confidence_session_list_falls_back_to_request_estimates() -> AppResult<()> {
-        let db_path = temp_db_path("cursor-low-confidence-session-list");
+    fn cursor_session_list_reads_estimates_from_session_token_totals() -> AppResult<()> {
+        let db_path = temp_db_path("cursor-estimated-session-list");
         let pool = init_db_with_path(&db_path)?;
         let conn = pool.get()?;
 
-        let session_id = "session-cursor-low";
-        let observation_id = "observation-cursor-low";
+        let session_id = "session-cursor-estimated";
+        let observation_id = "observation-cursor-estimated";
         let now = Utc::now();
 
         conn.execute(
@@ -213,7 +217,7 @@ mod tests {
             params![
                 session_id,
                 "cursor-external",
-                "cursor::session-cursor-low",
+                "cursor::session-cursor-estimated",
                 "Greeting in Chinese",
                 "gpt-5.5",
                 "gpt-5.5",
@@ -236,8 +240,8 @@ mod tests {
                 message_count,
                 source_model,
                 scan_run_id
-             ) VALUES (?1, ?2, ?3, 0, 0, 0, ?4, 5, 'gpt-5.5', 'scan-run-test')",
-            params![observation_id, session_id, now, "checksum-cursor-low"],
+             ) VALUES (?1, ?2, ?3, 53, 3719, 3772, ?4, 5, 'gpt-5.5', 'scan-run-test')",
+            params![observation_id, session_id, now, "checksum-cursor-estimated"],
         )?;
 
         conn.execute(
@@ -248,7 +252,7 @@ mod tests {
                 total_tokens_max,
                 last_observed_at,
                 last_observation_id
-             ) VALUES (?1, 0, 0, 0, ?2, ?3)",
+             ) VALUES (?1, 53, 3719, 3772, ?2, ?3)",
             params![session_id, now, observation_id],
         )?;
 
@@ -275,10 +279,10 @@ mod tests {
                 estimated_cost_usd
              ) VALUES (
                 ?1, ?2, ?3, 'cursor', ?4, 1, 'completed', 2, 'gpt-5.5',
-                53, 3719, 3772, 'low', ?5, ?6, '{}', 0, 0, NULL
+                53, 3719, 3772, NULL, ?5, ?6, '{}', 0, 0, NULL
              )",
             params![
-                "request-cursor-low",
+                "request-cursor-estimated",
                 session_id,
                 observation_id,
                 "request-source-id",
@@ -298,8 +302,100 @@ mod tests {
         assert_eq!(item.input_tokens, 53);
         assert_eq!(item.output_tokens, 3719);
         assert_eq!(item.total_tokens, 3772);
-        assert_eq!(item.token_confidence.as_deref(), Some("low"));
+        assert_eq!(item.token_confidence, None);
         assert_eq!(item.messages, 5);
+
+        drop(conn);
+        drop(pool);
+        cleanup_temp_db(&db_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn session_list_falls_back_to_request_tokens_when_totals_are_stale() -> AppResult<()> {
+        let db_path = temp_db_path("stale-session-token-totals");
+        let pool = init_db_with_path(&db_path)?;
+        let conn = pool.get()?;
+
+        let session_id = "session-kiro-stale-totals";
+        let observation_id = "observation-kiro-stale-totals";
+        let now = Utc::now();
+
+        conn.execute(
+            "INSERT INTO sessions (
+                id, source_app, external_session_id, session_key, title,
+                model_first, model_last, source_created_at, source_updated_at,
+                discovered_first_at, discovered_last_at, source_state
+             ) VALUES (?1, 'kiro', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'synced')",
+            params![
+                session_id,
+                "kiro-external",
+                "kiro::session-stale-totals",
+                "Kiro stale totals",
+                "claude-sonnet-4",
+                "claude-sonnet-4",
+                now,
+                now,
+                now,
+                now,
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO session_observations (
+                id, session_id, observed_at, input_tokens, output_tokens, total_tokens,
+                conversation_checksum, message_count, source_model, scan_run_id
+             ) VALUES (?1, ?2, ?3, 0, 0, 0, ?4, 2, 'claude-sonnet-4', 'scan-run-test')",
+            params![
+                observation_id,
+                session_id,
+                now,
+                "checksum-kiro-stale-totals"
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO session_token_totals (
+                session_id, input_tokens_max, output_tokens_max, total_tokens_max,
+                last_observed_at, last_observation_id
+             ) VALUES (?1, 0, 0, 0, ?2, ?3)",
+            params![session_id, now, observation_id],
+        )?;
+
+        conn.execute(
+            "INSERT INTO session_requests (
+                id, session_id, observation_id, source_app, source_request_id,
+                sequence_no, status, message_count, model, input_tokens, output_tokens,
+                total_tokens, token_confidence, source_created_at, source_updated_at,
+                source_locator, cache_read_input_tokens, cache_write_input_tokens,
+                estimated_cost_usd
+             ) VALUES (
+                ?1, ?2, ?3, 'kiro', ?4, 1, 'completed', 2, 'claude-sonnet-4',
+                120, 340, 460, 'low', ?5, ?6, '{}', 0, 0, NULL
+             )",
+            params![
+                "request-kiro-stale-totals",
+                session_id,
+                observation_id,
+                "request-source-id",
+                now,
+                now,
+            ],
+        )?;
+
+        let repository = Repository::new(pool.clone());
+        let response = repository.sessions_list(None)?;
+        let item = response
+            .items
+            .into_iter()
+            .find(|item| item.id == session_id)
+            .expect("session should be returned");
+
+        assert_eq!(item.input_tokens, 120);
+        assert_eq!(item.output_tokens, 340);
+        assert_eq!(item.total_tokens, 460);
+        assert_eq!(item.token_confidence, None);
 
         drop(conn);
         drop(pool);
@@ -374,6 +470,89 @@ mod tests {
             sort_order: None,
         }));
         assert!(unsupported_filter.is_err());
+
+        drop(conn);
+        drop(pool);
+        cleanup_temp_db(&db_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_workspace_empty_shell_sessions_are_hidden_from_session_lists() -> AppResult<()> {
+        let db_path = temp_db_path("cursor-workspace-empty-shell-session-list");
+        let pool = init_db_with_path(&db_path)?;
+        let conn = pool.get()?;
+        let now = Utc::now();
+
+        for (session_id, title, session_key) in [
+            ("session-empty-shell", None, "cursor:empty-shell"),
+            (
+                "session-real-global",
+                Some("Real Cursor Session"),
+                "cursor:real-global",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (
+                    id,
+                    source_app,
+                    external_session_id,
+                    session_key,
+                    title,
+                    model_first,
+                    model_last,
+                    source_created_at,
+                    source_updated_at,
+                    discovered_first_at,
+                    discovered_last_at,
+                    source_state
+                 ) VALUES (?1, 'cursor', ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, 'synced')",
+                params![
+                    session_id,
+                    session_key,
+                    session_key,
+                    title,
+                    now,
+                    now,
+                    now,
+                    now
+                ],
+            )?;
+        }
+
+        conn.execute(
+            "INSERT INTO session_source_refs (
+                session_id, source_path, source_file_id, last_linked_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "session-empty-shell",
+                "C:/Cursor/User/workspaceStorage/hash/state.vscdb",
+                "workspace-source-file",
+                now
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO session_source_refs (
+                session_id, source_path, source_file_id, last_linked_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "session-real-global",
+                "C:/Cursor/User/globalStorage/state.vscdb",
+                "global-source-file",
+                now
+            ],
+        )?;
+
+        let repository = Repository::new(pool.clone());
+        let response = repository.sessions_list(None)?;
+
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].id, "session-real-global");
+        assert_eq!(response.pagination.total_items, 1);
+        assert_eq!(response.facets.source_apps.len(), 1);
+        assert_eq!(response.facets.source_apps[0].value, "cursor");
+        assert_eq!(response.facets.source_apps[0].count, 1);
 
         drop(conn);
         drop(pool);
@@ -527,6 +706,40 @@ mod tests {
         assert_eq!(activity.sessions.max_value, 2.0);
         assert_eq!(activity.tokens.max_value, 200.0);
         assert!((activity.cost.max_value - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn statistics_summary_compares_estimated_cost_to_previous_period() {
+        let event_time = Utc::now();
+        let current_events = vec![StatisticsEventRecord {
+            session_id: "session-current".to_string(),
+            event_time_utc: event_time,
+            source_app: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            delta_input: 400,
+            delta_output: 600,
+            delta_total: 1000,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            estimated_cost_usd: Some(14.0),
+        }];
+        let previous_events = vec![StatisticsEventRecord {
+            session_id: "session-previous".to_string(),
+            event_time_utc: event_time - Duration::days(1),
+            source_app: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            delta_input: 100,
+            delta_output: 200,
+            delta_total: 300,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            estimated_cost_usd: Some(1.0),
+        }];
+
+        let summary = build_statistics_summary(&current_events, &previous_events);
+
+        assert!((summary.estimated_cost_usd.value - 14.0).abs() < 1e-9);
+        assert_eq!(summary.estimated_cost_usd.delta_percent, 1300.0);
     }
 
     #[test]

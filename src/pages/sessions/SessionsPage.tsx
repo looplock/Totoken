@@ -104,7 +104,7 @@ export function SessionsPage() {
           page,
           pageSize: rowsPerPage,
           q: deferredSearch,
-          sourceApps: sourceFilter === 'all' ? undefined : [sourceFilter],
+          sourceApps: sourceFilter === 'all' ? enabledSourceApps : [sourceFilter],
           sourceStates: stateFilter === 'all' ? undefined : [stateFilter],
           sortBy: sortField,
           sortOrder: sortDirection,
@@ -131,7 +131,17 @@ export function SessionsPage() {
         }
       }
     },
-    [deferredSearch, page, rowsPerPage, sortDirection, sortField, sourceFilter, stateFilter, t],
+    [
+      deferredSearch,
+      enabledSourceApps,
+      page,
+      rowsPerPage,
+      sortDirection,
+      sortField,
+      sourceFilter,
+      stateFilter,
+      t,
+    ],
   );
 
   useEffect(() => {

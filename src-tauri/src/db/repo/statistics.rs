@@ -401,7 +401,7 @@ fn statistics_event_matches(
     true
 }
 
-fn build_statistics_summary(
+pub(super) fn build_statistics_summary(
     current_events: &[StatisticsEventRecord],
     previous_events: &[StatisticsEventRecord],
 ) -> StatisticsSummary {
@@ -412,6 +412,10 @@ fn build_statistics_summary(
         total_tokens: build_statistics_metric(current.total_tokens, previous.total_tokens),
         input_tokens: build_statistics_metric(current.input_tokens, previous.input_tokens),
         output_tokens: build_statistics_metric(current.output_tokens, previous.output_tokens),
+        estimated_cost_usd: build_statistics_cost_metric(
+            current.estimated_cost_usd,
+            previous.estimated_cost_usd,
+        ),
         total_sessions: build_statistics_metric(
             current.sessions.len() as i64,
             previous.sessions.len() as i64,
@@ -432,6 +436,7 @@ fn accumulate_statistics_summary(events: &[StatisticsEventRecord]) -> Statistics
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        estimated_cost_usd: 0.0,
         sessions: BTreeSet::new(),
         models: BTreeSet::new(),
     };
@@ -440,6 +445,7 @@ fn accumulate_statistics_summary(events: &[StatisticsEventRecord]) -> Statistics
         summary.input_tokens += event.delta_input;
         summary.output_tokens += event.delta_output;
         summary.total_tokens += event.delta_total;
+        summary.estimated_cost_usd += event.estimated_cost_usd.unwrap_or(0.0);
         summary.sessions.insert(event.session_id.clone());
         summary.models.insert(event.model.clone());
     }
@@ -451,6 +457,13 @@ fn build_statistics_metric(current: i64, previous: i64) -> StatisticsMetricValue
     StatisticsMetricValue {
         value: current,
         delta_percent: compute_delta_percent(current, previous),
+    }
+}
+
+fn build_statistics_cost_metric(current: f64, previous: f64) -> StatisticsCostMetricValue {
+    StatisticsCostMetricValue {
+        value: current,
+        delta_percent: compute_delta_percent_f64(current, previous),
     }
 }
 
@@ -689,14 +702,20 @@ fn average_tokens_per_session(total_tokens: i64, session_count: usize) -> i64 {
 }
 
 fn compute_delta_percent(current: i64, previous: i64) -> f64 {
-    let delta = if previous <= 0 {
-        if current <= 0 {
+    compute_delta_percent_f64(current as f64, previous as f64)
+}
+
+fn compute_delta_percent_f64(current: f64, previous: f64) -> f64 {
+    let delta = if !current.is_finite() || !previous.is_finite() {
+        0.0
+    } else if previous <= 0.0 {
+        if current <= 0.0 {
             0.0
         } else {
             100.0
         }
     } else {
-        ((current - previous) as f64 / previous as f64) * 100.0
+        ((current - previous) / previous) * 100.0
     };
 
     (delta * 10.0).round() / 10.0

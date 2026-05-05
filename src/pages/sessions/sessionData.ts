@@ -11,7 +11,6 @@ export type SessionRecord = {
   outputTokens: number;
   totalTokens: number;
   estimatedCostUsd: number | null;
-  tokenConfidence?: 'high' | 'low';
   lastUpdated: string;
   messages: number;
   sourceState: SessionSourceState;
