@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, FolderOpen, FolderCog, Info, RotateCcw, Save, Search } from 'lucide-react';
+import { ChevronDown, FolderOpen, FolderCog, Info, RotateCcw, Search } from 'lucide-react';
 import { useI18n } from '../../i18n/useI18n';
 import { EmptyState } from '../../components/empty-state/EmptyState';
 import { Switch } from '../../components/switch/Switch';
@@ -103,7 +103,6 @@ export function SettingsPage() {
     return defaults;
   });
   const [search, setSearch] = useState('');
-  const [saveMessageVisible, setSaveMessageVisible] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [hasLoadedSettings, setHasLoadedSettings] = useState(false);
@@ -203,7 +202,6 @@ export function SettingsPage() {
   const hasVisibleSections = visibleSections.size > 0;
 
   const updateSettings = (updater: (current: SettingsState) => SettingsState) => {
-    setSaveMessageVisible(false);
     setErrorMessage(null);
     setSettings((current) => updater(current));
   };
@@ -227,44 +225,6 @@ export function SettingsPage() {
     [applyUiPreferences],
   );
 
-  const persistUiPreferences = async (uiPreferences: SettingsState['uiPreferences']) => {
-    const previousSavedSettings = savedSettings;
-    const nextPersistedSettings: SettingsState = {
-      ...previousSavedSettings,
-      uiPreferences,
-    };
-
-    setSaveMessageVisible(false);
-    setErrorMessage(null);
-    setSettings((current) => ({
-      ...current,
-      uiPreferences,
-    }));
-    applyUiPreferences(uiPreferences);
-    setIsSaving(true);
-
-    try {
-      const saved = await saveSettings(nextPersistedSettings);
-      setSavedSettings(saved);
-      setSettings((current) => ({
-        ...current,
-        uiPreferences: saved.uiPreferences,
-      }));
-      syncUiPreferenceEffects(saved.uiPreferences);
-    } catch (error) {
-      setSettings((current) => ({
-        ...current,
-        uiPreferences: previousSavedSettings.uiPreferences,
-      }));
-      syncUiPreferenceEffects(previousSavedSettings.uiPreferences);
-
-      const message = error instanceof Error ? error.message : t('settings.feedback.saveFailed');
-      setErrorMessage(message);
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
   useEffect(() => {
     let cancelled = false;
 
@@ -272,7 +232,6 @@ export function SettingsPage() {
       setIsLoading(true);
       setHasLoadedSettings(false);
       setErrorMessage(null);
-      setSaveMessageVisible(false);
 
       try {
         const loaded = await fetchSettings();
@@ -283,7 +242,6 @@ export function SettingsPage() {
         setSettings(loaded);
         setSavedSettings(loaded);
         setHasLoadedSettings(true);
-        setSaveMessageVisible(false);
         syncUiPreferenceEffects(loaded.uiPreferences);
 
         const storage = await fetchStorageConfig();
@@ -299,7 +257,6 @@ export function SettingsPage() {
         const message = error instanceof Error ? error.message : t('settings.feedback.loadFailed');
         setHasLoadedSettings(false);
         setErrorMessage(message);
-        setSaveMessageVisible(false);
       } finally {
         if (!cancelled) {
           setIsLoading(false);
@@ -335,29 +292,43 @@ export function SettingsPage() {
     };
   }, [settings.scheduler]);
 
-  const saveChanges = async () => {
-    if (!hasLoadedSettings) {
-      setErrorMessage(t('settings.feedback.loadFailed'));
+  useEffect(() => {
+    if (!hasLoadedSettings || isLoading || !dirty) {
       return;
     }
 
-    setIsSaving(true);
-    setErrorMessage(null);
+    let cancelled = false;
+    const timeoutId = window.setTimeout(async () => {
+      setIsSaving(true);
+      setErrorMessage(null);
 
-    try {
-      const saved = await saveSettings(settings);
-      setSettings(saved);
-      setSavedSettings(saved);
-      setSaveMessageVisible(true);
-      syncUiPreferenceEffects(saved.uiPreferences);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : t('settings.feedback.saveFailed');
-      setErrorMessage(message);
-      setSaveMessageVisible(false);
-    } finally {
-      setIsSaving(false);
-    }
-  };
+      try {
+        const saved = await saveSettings(settings);
+        if (cancelled) {
+          return;
+        }
+
+        setSavedSettings(saved);
+        setSettings((current) => (settingsEqual(current, settings) ? saved : current));
+        syncUiPreferenceEffects(saved.uiPreferences);
+      } catch (error) {
+        if (!cancelled) {
+          const message =
+            error instanceof Error ? error.message : t('settings.feedback.saveFailed');
+          setErrorMessage(message);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSaving(false);
+        }
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [dirty, hasLoadedSettings, isLoading, settings, syncUiPreferenceEffects, t]);
 
   const restoreDefaults = async () => {
     if (!hasLoadedSettings) {
@@ -372,7 +343,6 @@ export function SettingsPage() {
       const defaults = await resetSettings();
       setSettings(defaults);
       setSavedSettings(defaults);
-      setSaveMessageVisible(false);
       syncUiPreferenceEffects(defaults.uiPreferences);
     } catch (error) {
       const message = error instanceof Error ? error.message : t('settings.feedback.resetFailed');
@@ -385,7 +355,6 @@ export function SettingsPage() {
   const updateStoragePath = async (nextPath: string | null) => {
     setIsUpdatingStorage(true);
     setErrorMessage(null);
-    setSaveMessageVisible(false);
 
     try {
       const nextStorage = await setStorageDataDir(nextPath);
@@ -441,16 +410,6 @@ export function SettingsPage() {
             <RotateCcw size={16} />
             <span>{t('settings.actions.restore')}</span>
           </button>
-
-          <button
-            type="button"
-            className="settings-btn settings-btn-primary"
-            onClick={() => void saveChanges()}
-            disabled={!canEditSettings || !dirty || isSaving}
-          >
-            <Save size={16} />
-            <span>{t('settings.actions.save')}</span>
-          </button>
         </div>
       </section>
 
@@ -458,13 +417,6 @@ export function SettingsPage() {
         <div className="settings-notice">
           <Info size={17} />
           <span>{errorMessage}</span>
-        </div>
-      ) : null}
-
-      {saveMessageVisible ? (
-        <div className="settings-notice">
-          <Info size={17} />
-          <span>{t('settings.feedback.saved')}</span>
         </div>
       ) : null}
 
@@ -832,15 +784,23 @@ export function SettingsPage() {
                             <select
                               className="settings-select"
                               value={currentThemeFamily}
-                              onChange={(event) =>
-                                void persistUiPreferences({
+                              onChange={(event) => {
+                                const nextTheme = composeThemeMode(
+                                  event.target.value as ThemeFamily,
+                                  currentThemeAppearance,
+                                );
+                                applyUiPreferences({
                                   ...settings.uiPreferences,
-                                  theme: composeThemeMode(
-                                    event.target.value as ThemeFamily,
-                                    currentThemeAppearance,
-                                  ),
-                                })
-                              }
+                                  theme: nextTheme,
+                                });
+                                updateSettings((current) => ({
+                                  ...current,
+                                  uiPreferences: {
+                                    ...current.uiPreferences,
+                                    theme: nextTheme,
+                                  },
+                                }));
+                              }}
                             >
                               {THEME_GROUPS.map(({ family, labelKey }) => (
                                 <option key={family} value={family}>
@@ -866,15 +826,23 @@ export function SettingsPage() {
                           <Switch
                             size="sm"
                             checked={currentThemeAppearance === 'dark'}
-                            onToggle={() =>
-                              void persistUiPreferences({
+                            onToggle={() => {
+                              const nextTheme = composeThemeMode(
+                                currentThemeFamily,
+                                currentThemeAppearance === 'dark' ? 'light' : 'dark',
+                              );
+                              applyUiPreferences({
                                 ...settings.uiPreferences,
-                                theme: composeThemeMode(
-                                  currentThemeFamily,
-                                  currentThemeAppearance === 'dark' ? 'light' : 'dark',
-                                ),
-                              })
-                            }
+                                theme: nextTheme,
+                              });
+                              updateSettings((current) => ({
+                                ...current,
+                                uiPreferences: {
+                                  ...current.uiPreferences,
+                                  theme: nextTheme,
+                                },
+                              }));
+                            }}
                             label={t('settings.preferences.themeDark')}
                           />
                         </div>
@@ -891,10 +859,17 @@ export function SettingsPage() {
                           value={settings.uiPreferences.language}
                           onChange={(event) => {
                             const nextLanguage = event.target.value as 'zh-CN' | 'en-US';
-                            void persistUiPreferences({
+                            applyUiPreferences({
                               ...settings.uiPreferences,
                               language: nextLanguage,
                             });
+                            updateSettings((current) => ({
+                              ...current,
+                              uiPreferences: {
+                                ...current.uiPreferences,
+                                language: nextLanguage,
+                              },
+                            }));
                           }}
                         >
                           <option value="en-US">English (US)</option>

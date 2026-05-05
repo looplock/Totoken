@@ -159,7 +159,6 @@ export const zhMessages = {
   'settings.search.placeholder': '搜索设置',
   'settings.search.empty': '没有匹配当前搜索条件的设置项。',
   'settings.actions.restore': '恢复默认',
-  'settings.actions.save': '保存更改',
   'settings.actions.browse': '浏览路径',
   'settings.section.scheduler': '扫描调度器',
   'settings.section.storage': '存储路径',
@@ -219,7 +218,6 @@ export const zhMessages = {
   'settings.preferences.tokenUnits': '本地化 Token 单位',
   'settings.preferences.tokenUnitsHint':
     '根据当前语言显示 Token 缩写单位。关闭后始终使用 K、M、B 等英文单位。',
-  'settings.feedback.saved': '设置已保存',
   'settings.feedback.loading': '正在加载设置...',
   'settings.feedback.loadFailed': '加载设置失败。',
   'settings.feedback.saveFailed': '保存设置失败。',

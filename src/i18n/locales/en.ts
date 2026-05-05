@@ -165,7 +165,6 @@ export const enMessages = {
   'settings.search.placeholder': 'Search settings',
   'settings.search.empty': 'No settings sections match the current search.',
   'settings.actions.restore': 'Restore Defaults',
-  'settings.actions.save': 'Save Changes',
   'settings.actions.browse': 'Browse Path',
   'settings.section.scheduler': 'Scan Scheduler',
   'settings.section.storage': 'Storage',
@@ -230,7 +229,6 @@ export const enMessages = {
   'settings.preferences.tokenUnits': 'Localized token units',
   'settings.preferences.tokenUnitsHint':
     'Use language-specific compact units for token counts. Turn off to always use English units such as K, M, and B.',
-  'settings.feedback.saved': 'Settings saved',
   'settings.feedback.loading': 'Loading settings...',
   'settings.feedback.loadFailed': 'Failed to load settings.',
   'settings.feedback.saveFailed': 'Failed to save settings.',
