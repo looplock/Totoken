@@ -266,6 +266,13 @@ impl Scanner {
         result
     }
 
+    pub fn has_scannable_data(&self, root_path: PathBuf, source_app: &str) -> AppResult<bool> {
+        let source_adapter = self
+            .adapter_for_source_app(source_app)
+            .ok_or_else(|| AppError::validation("Unsupported source adapter for scan"))?;
+        source_adapter.has_scannable_data(&root_path)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_source_file(
         &self,
