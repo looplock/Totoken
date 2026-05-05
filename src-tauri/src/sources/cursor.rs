@@ -55,6 +55,7 @@ struct CursorParsedTurn {
     high_output_tokens: i64,
     estimated_input_tokens: Option<i64>,
     estimated_output_tokens: Option<i64>,
+    estimated_tool_result_tokens: Option<i64>,
     usage_event_id: Option<String>,
 }
 
@@ -64,7 +65,7 @@ impl SourceAdapter for CursorAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        3
+        4
     }
 
     fn can_handle(&self, path: &Path) -> bool {
@@ -473,6 +474,14 @@ fn build_normalized_session(
         checksum_parts.push(message.character_count.unwrap_or(0).to_string());
         checksum_parts.push(message.high_input_tokens.to_string());
         checksum_parts.push(message.high_output_tokens.to_string());
+        checksum_parts.push(message.estimated_input_tokens.unwrap_or(0).to_string());
+        checksum_parts.push(message.estimated_output_tokens.unwrap_or(0).to_string());
+        checksum_parts.push(
+            message
+                .estimated_tool_result_tokens
+                .unwrap_or(0)
+                .to_string(),
+        );
         checksum_parts.push(
             bubble_payload
                 .get("text")
@@ -686,6 +695,8 @@ fn build_cursor_request_estimates(
     let mut estimates = HashMap::<String, CursorRequestEstimate>::new();
     let mut current_request_id: Option<String> = None;
     let mut generated_sequence_no = 0_i64;
+    let mut rolling_context_tokens = 0_i64;
+    let mut pending_model_input = false;
 
     for message in parsed_messages {
         if message.role == "user" || current_request_id.is_none() {
@@ -701,8 +712,31 @@ fn build_cursor_request_estimates(
             continue;
         };
         let estimate = estimates.entry(request_id.clone()).or_default();
-        estimate.input_tokens += message.estimated_input_tokens.unwrap_or(0);
-        estimate.output_tokens += message.estimated_output_tokens.unwrap_or(0);
+        match message.role.as_str() {
+            "user" => {
+                rolling_context_tokens += message.estimated_input_tokens.unwrap_or(0);
+                pending_model_input = true;
+            }
+            "assistant" => {
+                if pending_model_input && rolling_context_tokens > 0 {
+                    estimate.input_tokens += rolling_context_tokens;
+                    pending_model_input = false;
+                }
+                let output_tokens = message.estimated_output_tokens.unwrap_or(0);
+                estimate.output_tokens += output_tokens;
+                rolling_context_tokens += output_tokens;
+            }
+            "tool" => {
+                let tool_call_tokens = message.estimated_output_tokens.unwrap_or(0);
+                let tool_result_tokens = message.estimated_tool_result_tokens.unwrap_or(0);
+                estimate.output_tokens += tool_call_tokens;
+                rolling_context_tokens += tool_call_tokens + tool_result_tokens;
+                if tool_result_tokens > 0 {
+                    pending_model_input = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     estimates
@@ -789,45 +823,55 @@ fn parse_bubble(
     let high_input_tokens = if input_tokens > 0 { input_tokens } else { 0 };
     let high_output_tokens = if output_tokens > 0 { output_tokens } else { 0 };
 
-    let (role, message_type, estimated_input_tokens, estimated_output_tokens, character_count) =
-        if bubble_header.bubble_type == 1 {
-            let character_count = text.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "user".to_string(),
-                "message".to_string(),
-                text.as_deref().map(estimate_text_tokens),
-                None,
-                character_count,
-            )
-        } else if capability_type == Some(30) {
-            let character_count = text.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "assistant".to_string(),
-                "thinking".to_string(),
-                None,
-                text.as_deref().map(estimate_text_tokens),
-                character_count,
-            )
-        } else if capability_type == Some(15) || tool_name.is_some() {
-            let summary = build_tool_summary(tool_name.as_deref(), tool_status.as_deref());
-            let character_count = summary.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "tool".to_string(),
-                "tool".to_string(),
-                None,
-                None,
-                character_count,
-            )
-        } else {
-            let character_count = text.as_ref().map(|value| value.chars().count() as i64);
-            (
-                "assistant".to_string(),
-                "message".to_string(),
-                None,
-                text.as_deref().map(estimate_text_tokens),
-                character_count,
-            )
-        };
+    let (
+        role,
+        message_type,
+        estimated_input_tokens,
+        estimated_output_tokens,
+        estimated_tool_result_tokens,
+        character_count,
+    ) = if bubble_header.bubble_type == 1 {
+        let character_count = text.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "user".to_string(),
+            "message".to_string(),
+            text.as_deref().map(estimate_text_tokens),
+            None,
+            None,
+            character_count,
+        )
+    } else if capability_type == Some(30) {
+        let character_count = text.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "assistant".to_string(),
+            "thinking".to_string(),
+            None,
+            text.as_deref().map(estimate_text_tokens),
+            None,
+            character_count,
+        )
+    } else if capability_type == Some(15) || tool_name.is_some() {
+        let summary = build_tool_summary(tool_name.as_deref(), tool_status.as_deref());
+        let character_count = summary.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "tool".to_string(),
+            "tool".to_string(),
+            None,
+            estimate_tool_call_tokens(bubble_payload),
+            estimate_tool_result_tokens(bubble_payload),
+            character_count,
+        )
+    } else {
+        let character_count = text.as_ref().map(|value| value.chars().count() as i64);
+        (
+            "assistant".to_string(),
+            "message".to_string(),
+            None,
+            text.as_deref().map(estimate_text_tokens),
+            None,
+            character_count,
+        )
+    };
 
     CursorParsedTurn {
         source_message_id: bubble_header.bubble_id.clone(),
@@ -842,6 +886,7 @@ fn parse_bubble(
         high_output_tokens,
         estimated_input_tokens,
         estimated_output_tokens,
+        estimated_tool_result_tokens,
         usage_event_id: bubble_payload
             .get("usageUuid")
             .and_then(Value::as_str)
@@ -853,6 +898,47 @@ fn parse_bubble(
                     .and_then(|value| normalize_optional_text(Some(value)))
             }),
     }
+}
+
+fn estimate_tool_call_tokens(bubble_payload: &Value) -> Option<i64> {
+    let tool_data = bubble_payload.get("toolFormerData")?;
+    max_estimated_tokens([
+        estimate_string_value_tokens(tool_data.get("rawArgs")),
+        estimate_string_value_tokens(tool_data.get("params")),
+    ])
+}
+
+fn estimate_tool_result_tokens(bubble_payload: &Value) -> Option<i64> {
+    let tool_data = bubble_payload.get("toolFormerData")?;
+    max_estimated_tokens([
+        estimate_string_value_tokens(tool_data.get("result")),
+        estimate_json_value_tokens(tool_data.get("additionalData")),
+    ])
+}
+
+fn estimate_string_value_tokens(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|value| normalize_optional_text(Some(value)))
+        .map(|value| estimate_text_tokens(&value))
+}
+
+fn estimate_json_value_tokens(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+
+    let serialized = serde_json::to_string(value).ok()?;
+    normalize_optional_text(Some(&serialized)).map(|value| estimate_text_tokens(&value))
+}
+
+fn max_estimated_tokens(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    values
+        .into_iter()
+        .flatten()
+        .max()
+        .filter(|value| *value > 0)
 }
 
 fn extract_conversation_headers(payload: &Value) -> Vec<CursorBubbleHeader> {
@@ -1289,6 +1375,115 @@ mod tests {
         .expect("insert low confidence assistant bubble");
     }
 
+    fn write_low_confidence_tool_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open low confidence tool fixture db");
+        conn.execute_batch(
+            "
+            CREATE TABLE ItemTable (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            CREATE TABLE cursorDiskKV (
+                key TEXT PRIMARY KEY,
+                value BLOB
+            );
+            ",
+        )
+        .expect("create low confidence tool cursor schema");
+
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composer.composerHeaders",
+                json!({
+                    "allComposers": [{
+                        "composerId": "cmp_low_tool_1",
+                        "name": "Cursor Tool Session",
+                        "createdAt": 1_747_465_749_805_i64,
+                        "lastUpdatedAt": 1_747_466_678_347_i64
+                    }]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert low confidence tool composer headers");
+
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                "composerData:cmp_low_tool_1",
+                json!({
+                    "_v": 1,
+                    "composerId": "cmp_low_tool_1",
+                    "status": "completed",
+                    "fullConversationHeadersOnly": [
+                        { "bubbleId": "bubble_user_1", "type": 1, "grouping": { "isRenderable": true } },
+                        { "bubbleId": "bubble_assistant_1", "type": 2, "grouping": { "isRenderable": true } },
+                        { "bubbleId": "bubble_tool_1", "type": 2, "capabilityType": 15, "grouping": { "isRenderable": true } },
+                        { "bubbleId": "bubble_assistant_2", "type": 2, "grouping": { "isRenderable": true } }
+                    ]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert low confidence tool composer");
+
+        for (bubble_id, payload) in [
+            (
+                "bubble_user_1",
+                json!({
+                    "bubbleId": "bubble_user_1",
+                    "type": 1,
+                    "text": "abcd",
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+            (
+                "bubble_assistant_1",
+                json!({
+                    "bubbleId": "bubble_assistant_1",
+                    "type": 2,
+                    "text": "efgh",
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+            (
+                "bubble_tool_1",
+                json!({
+                    "bubbleId": "bubble_tool_1",
+                    "type": 2,
+                    "capabilityType": 15,
+                    "text": "",
+                    "toolFormerData": {
+                        "name": "read_file",
+                        "status": "completed",
+                        "rawArgs": "ijkl",
+                        "result": "r".repeat(120)
+                    },
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+            (
+                "bubble_assistant_2",
+                json!({
+                    "bubbleId": "bubble_assistant_2",
+                    "type": 2,
+                    "text": "mnop",
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                }),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("bubbleId:cmp_low_tool_1:{bubble_id}"),
+                    payload.to_string()
+                ],
+            )
+            .expect("insert low confidence tool bubble");
+        }
+    }
+
     fn write_workspace_fixture_db(path: &Path) {
         let conn = Connection::open(path).expect("open workspace cursor fixture db");
         conn.execute_batch(
@@ -1475,6 +1670,75 @@ mod tests {
         assert_eq!(session.total_input_tokens, 0);
         assert_eq!(session.total_output_tokens, 0);
         assert!(session.events.is_empty());
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn cursor_low_confidence_estimates_include_tool_results_as_follow_up_context() {
+        let db_path = unique_temp_db_path("low-confidence-tool");
+        write_low_confidence_tool_fixture_db(&db_path);
+
+        let sessions = CursorAdapter
+            .parse(&db_path)
+            .expect("parse low confidence cursor tool fixture");
+
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.requests.len(), 1);
+        let request = &session.requests[0];
+        assert_eq!(request.token_confidence.as_deref(), Some("low"));
+        assert_eq!(request.input_tokens, Some(34));
+        assert_eq!(request.output_tokens, Some(3));
+        assert_eq!(request.total_tokens, Some(37));
+        assert_eq!(session.total_input_tokens, 0);
+        assert_eq!(session.total_output_tokens, 0);
+        assert!(session.events.is_empty());
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn cursor_low_confidence_checksum_changes_with_tool_result_estimates() {
+        let db_path = unique_temp_db_path("low-confidence-tool-checksum");
+        write_low_confidence_tool_fixture_db(&db_path);
+
+        let initial = CursorAdapter
+            .parse(&db_path)
+            .expect("parse initial low confidence cursor tool fixture");
+        assert_eq!(initial[0].requests[0].input_tokens, Some(34));
+
+        let conn = Connection::open(&db_path).expect("open low confidence tool checksum db");
+        conn.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+            rusqlite::params![
+                json!({
+                    "bubbleId": "bubble_tool_1",
+                    "type": 2,
+                    "capabilityType": 15,
+                    "text": "",
+                    "toolFormerData": {
+                        "name": "read_file",
+                        "status": "completed",
+                        "rawArgs": "ijkl",
+                        "result": "r".repeat(240)
+                    },
+                    "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
+                })
+                .to_string(),
+                "bubbleId:cmp_low_tool_1:bubble_tool_1"
+            ],
+        )
+        .expect("update low confidence tool result");
+
+        let updated = CursorAdapter
+            .parse(&db_path)
+            .expect("parse updated low confidence cursor tool fixture");
+        assert_ne!(
+            initial[0].conversation_checksum,
+            updated[0].conversation_checksum
+        );
+        assert_eq!(updated[0].requests[0].input_tokens, Some(64));
 
         let _ = fs::remove_file(&db_path);
     }
