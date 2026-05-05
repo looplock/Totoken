@@ -3,6 +3,7 @@ import { AppIcon } from '../../components/app-icon/AppIcon';
 import { EmptyState } from '../../components/empty-state/EmptyState';
 import { Switch } from '../../components/switch/Switch';
 import { useI18n } from '../../i18n/useI18n';
+import type { SourceApp } from '../../lib/sourceApps';
 import { isTauriRuntime } from '../../lib/tauri';
 import { useRefreshEnabledSourceApps } from '../../lib/useEnabledSourceApps';
 import type { SourceRecord, SourceState } from './sourceData';
@@ -15,6 +16,8 @@ type ScopeEntry = {
   path: string;
   exists: boolean;
 };
+
+const experimentalSourceApps = new Set<SourceApp>(['cursor', 'kilocode', 'kiro']);
 
 export function SourcesPage() {
   const { t } = useI18n();
@@ -143,7 +146,7 @@ export function SourcesPage() {
                       <td>
                         <span className="sources-app-cell">
                           <AppIcon app={source.app} label={sourceName} />
-                          <span>{sourceName}</span>
+                          <SourceNameWithBadges source={source} sourceName={sourceName} t={t} />
                         </span>
                       </td>
                       <td>
@@ -183,7 +186,15 @@ export function SourcesPage() {
             <header className="sources-overview-header">
               <div>
                 <h2 className="sources-overview-title">
-                  {selectedSource ? formatSourceName(selectedSource.app, t) : t('sources.empty')}
+                  {selectedSource ? (
+                    <SourceNameWithBadges
+                      source={selectedSource}
+                      sourceName={formatSourceName(selectedSource.app, t)}
+                      t={t}
+                    />
+                  ) : (
+                    t('sources.empty')
+                  )}
                 </h2>
                 <p className="sources-overview-path">{selectedSource?.rootPath}</p>
               </div>
@@ -294,6 +305,27 @@ export function SourcesPage() {
   );
 }
 
+function SourceNameWithBadges({
+  source,
+  sourceName,
+  t,
+}: {
+  source: SourceRecord;
+  sourceName: string;
+  t: (key: string) => string;
+}) {
+  return (
+    <span className="sources-name-wrap">
+      <span className="sources-name-text">{sourceName}</span>
+      {experimentalSourceApps.has(source.app) ? (
+        <span className="sources-experimental-badge" title={t('sources.experimental.tooltip')}>
+          {t('sources.experimental.badge')}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function StatusCard({
   label,
   value,
@@ -364,12 +396,5 @@ function buildSourceDetailRows(
 }
 
 function formatSourceName(sourceApp: SourceRecord['app'], t: (key: string) => string): string {
-  const baseName = t(`session.source.${sourceApp}`);
-  if (sourceApp === 'opencode') {
-    return `${baseName} ${t('sources.sourceNote.cliOnly')}`;
-  }
-  if (sourceApp === 'kilocode') {
-    return `${baseName} ${t('sources.sourceNote.vscodeExtension')}`;
-  }
-  return baseName;
+  return t(`session.source.${sourceApp}`);
 }

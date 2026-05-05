@@ -317,8 +317,9 @@ export const enMessages = {
   'sources.status.disabled': 'Disabled',
   'sources.status.supported': 'Implemented',
   'sources.status.unsupported': 'Not implemented yet',
-  'sources.sourceNote.cliOnly': '(CLI only)',
-  'sources.sourceNote.vscodeExtension': '(VS Code extension)',
+  'sources.experimental.badge': 'Experimental',
+  'sources.experimental.tooltip':
+    'This source is still being adapted; some sessions or token totals may be incomplete.',
   'sources.scope.title': 'Scan Scope',
   'sources.scope.note': 'These directories will be read when this source runs a scan.',
   'sources.scope.primary': 'Primary Session Root',
