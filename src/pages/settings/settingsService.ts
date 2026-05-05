@@ -19,6 +19,7 @@ function normalizeSettings(settings: SettingsState): SettingsState {
       ...settings.uiPreferences,
       theme: normalizeThemeMode(settings.uiPreferences.theme),
       localizedTokenUnits: settings.uiPreferences.localizedTokenUnits ?? true,
+      closeAction: settings.uiPreferences.closeAction === 'tray' ? 'tray' : 'quit',
     },
   };
 }

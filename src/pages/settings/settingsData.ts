@@ -3,6 +3,7 @@ import { DEFAULT_THEME, type ThemeMode } from '../../theme/themes';
 export type { ThemeMode } from '../../theme/themes';
 
 export type ScanMode = 'auto' | 'manual';
+export type CloseAction = 'quit' | 'tray';
 
 export type StorageConfig = {
   bootstrapDir: string;
@@ -28,6 +29,7 @@ export type SettingsState = {
     language: 'zh-CN' | 'en-US';
     notifications: boolean;
     localizedTokenUnits: boolean;
+    closeAction: CloseAction;
   };
 };
 
@@ -82,6 +84,7 @@ export function createDefaultSettings(): SettingsState {
       language: 'en-US',
       notifications: true,
       localizedTokenUnits: true,
+      closeAction: 'quit',
     },
   };
 }

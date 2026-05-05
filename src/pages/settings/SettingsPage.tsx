@@ -9,6 +9,7 @@ import { useTheme } from '../../theme/useTheme';
 import { composeThemeMode, splitThemeMode, type ThemeFamily } from '../../theme/themes';
 import {
   createDefaultSettings,
+  type CloseAction,
   type ScanMode,
   type SchedulerPreview,
   type SettingsState,
@@ -81,7 +82,8 @@ function settingsEqual(left: SettingsState, right: SettingsState) {
     left.uiPreferences.theme === right.uiPreferences.theme &&
     left.uiPreferences.language === right.uiPreferences.language &&
     left.uiPreferences.notifications === right.uiPreferences.notifications &&
-    left.uiPreferences.localizedTokenUnits === right.uiPreferences.localizedTokenUnits
+    left.uiPreferences.localizedTokenUnits === right.uiPreferences.localizedTokenUnits &&
+    left.uiPreferences.closeAction === right.uiPreferences.closeAction
   );
 }
 
@@ -185,8 +187,11 @@ export function SettingsPage() {
         t('settings.preferences.themeLight'),
         t('settings.preferences.themeDark'),
         t('settings.preferences.language'),
+        t('settings.preferences.closeAction'),
+        t('settings.preferences.closeActionQuit'),
+        t('settings.preferences.closeActionTray'),
         t('settings.preferences.tokenUnits'),
-        'ui alerts language theme token units blue green amber light dark',
+        'ui alerts language theme close quit tray token units blue green amber light dark',
       )
     ) {
       result.add('preferences');
@@ -894,6 +899,32 @@ export function SettingsPage() {
                         >
                           <option value="en-US">English (US)</option>
                           <option value="zh-CN">简体中文</option>
+                        </select>
+                        <ChevronDown size={16} />
+                      </div>
+                    </label>
+
+                    <label className="settings-field settings-preference-item settings-control-card settings-control-card-field">
+                      <span className="settings-field-label">
+                        {t('settings.preferences.closeAction')}
+                      </span>
+                      <div className="settings-select-wrap">
+                        <select
+                          className="settings-select"
+                          value={settings.uiPreferences.closeAction}
+                          onChange={(event) => {
+                            const nextCloseAction = event.target.value as CloseAction;
+                            updateSettings((current) => ({
+                              ...current,
+                              uiPreferences: {
+                                ...current.uiPreferences,
+                                closeAction: nextCloseAction,
+                              },
+                            }));
+                          }}
+                        >
+                          <option value="quit">{t('settings.preferences.closeActionQuit')}</option>
+                          <option value="tray">{t('settings.preferences.closeActionTray')}</option>
                         </select>
                         <ChevronDown size={16} />
                       </div>
