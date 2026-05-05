@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +65,7 @@ impl SourceAdapter for CursorAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        4
+        5
     }
 
     fn can_handle(&self, path: &Path) -> bool {
@@ -138,7 +138,10 @@ impl SourceAdapter for CursorAdapter {
 
 impl CursorAdapter {
     fn push_candidate_path(&self, paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-        if self.can_handle(&candidate) && !paths.iter().any(|path| path == &candidate) {
+        if candidate.is_file()
+            && self.can_handle(&candidate)
+            && !paths.iter().any(|path| path == &candidate)
+        {
             paths.push(candidate);
         }
     }
@@ -168,7 +171,8 @@ impl CursorAdapter {
 fn parse_global_state_db(conn: &Connection, source_app: &str) -> AppResult<Vec<NormalizedSession>> {
     let headers_by_id = load_composer_headers(conn)?;
     let composer_rows = load_composer_rows(conn)?;
-    let bubbles_by_key = load_bubbles(conn)?;
+    let bubble_keys = collect_referenced_bubble_keys(&composer_rows);
+    let bubbles_by_key = load_bubbles(conn, &bubble_keys)?;
 
     Ok(build_sessions_from_composer_rows(
         source_app,
@@ -186,7 +190,8 @@ fn parse_workspace_state_db(
     let mut headers_by_id = load_composer_headers(conn)?;
     headers_by_id.extend(load_workspace_composer_headers(conn)?);
     let composer_rows = load_composer_rows(conn)?;
-    let bubbles_by_key = load_bubbles(conn)?;
+    let bubble_keys = collect_referenced_bubble_keys(&composer_rows);
+    let bubbles_by_key = load_bubbles(conn, &bubble_keys)?;
 
     Ok(build_sessions_from_composer_rows(
         source_app,
@@ -357,33 +362,57 @@ fn load_composer_rows(conn: &Connection) -> AppResult<HashMap<String, Value>> {
     Ok(grouped)
 }
 
-fn load_bubbles(conn: &Connection) -> AppResult<HashMap<(String, String), Value>> {
+fn collect_referenced_bubble_keys(composer_rows: &HashMap<String, Value>) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for (composer_id, payload) in composer_rows {
+        for bubble_header in extract_conversation_headers(payload) {
+            keys.insert(format!(
+                "bubbleId:{composer_id}:{}",
+                bubble_header.bubble_id
+            ));
+        }
+    }
+    keys
+}
+
+fn load_bubbles(
+    conn: &Connection,
+    bubble_keys: &HashSet<String>,
+) -> AppResult<HashMap<(String, String), Value>> {
     if !table_exists(conn, "cursorDiskKV")? {
         return Ok(HashMap::new());
     }
-
-    let mut stmt =
-        conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
+    if bubble_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
 
     let mut grouped = HashMap::new();
-    for row in rows {
-        let (key, value) = row?;
-        let Some(value) = value else {
-            continue;
-        };
-        let Some(rest) = key.strip_prefix("bubbleId:") else {
-            continue;
-        };
-        let Some((composer_id, bubble_id)) = rest.split_once(':') else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<Value>(&value) else {
-            continue;
-        };
-        grouped.insert((composer_id.to_string(), bubble_id.to_string()), payload);
+    let bubble_keys = bubble_keys.iter().collect::<Vec<_>>();
+    for chunk in bubble_keys.chunks(500) {
+        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT key, value FROM cursorDiskKV WHERE key IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(chunk.iter().map(|value| value.as_str())),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+
+        for row in rows {
+            let (key, value) = row?;
+            let Some(value) = value else {
+                continue;
+            };
+            let Some(rest) = key.strip_prefix("bubbleId:") else {
+                continue;
+            };
+            let Some((composer_id, bubble_id)) = rest.split_once(':') else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(&value) else {
+                continue;
+            };
+            grouped.insert((composer_id.to_string(), bubble_id.to_string()), payload);
+        }
     }
 
     Ok(grouped)
@@ -432,6 +461,7 @@ fn build_normalized_session(
     });
 
     let mut checksum_parts = vec![
+        "cursor-estimates-as-session-totals-v1".to_string(),
         composer_id.to_string(),
         session_model.clone().unwrap_or_default(),
         title.clone().unwrap_or_default(),
@@ -499,7 +529,7 @@ fn build_normalized_session(
 
     let message_count = parsed_messages.len() as i64;
     let fallback_event_time = source_updated_at.or(source_created_at);
-    let (mut requests, mut events, total_input_tokens, total_output_tokens) =
+    let (mut requests, events, total_input_tokens, total_output_tokens) =
         build_requests_messages_and_events(
             parsed_messages,
             fallback_event_time,
@@ -519,23 +549,6 @@ fn build_normalized_session(
         .next_back()
         .or(session_model);
     let conversation_checksum = hash::sha256_text(&checksum_parts.join("\n"));
-
-    if events.is_empty() && (total_input_tokens > 0 || total_output_tokens > 0) {
-        if let Some(event_time_utc) = fallback_event_time {
-            events.push(NormalizedUsageEvent {
-                event_time_utc,
-                model: model_last.clone(),
-                delta_input: total_input_tokens,
-                delta_output: total_output_tokens,
-                delta_total: total_input_tokens + total_output_tokens,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-                source_event_id: Some(composer_id.to_string()),
-                granularity: "session_total".to_string(),
-                confidence: "low".to_string(),
-            });
-        }
-    }
 
     Some(NormalizedSession {
         source_app: source_app.to_string(),
@@ -673,13 +686,15 @@ fn build_requests_messages_and_events(
     let aggregate = MessageStreamAggregator::new(stream_items)
         .aggregate_sequential_user_requests("cursor-request");
     let mut requests = aggregate.requests;
-    apply_cursor_low_confidence_estimates(&mut requests, &estimates_by_request_id);
+    apply_cursor_estimates(&mut requests, &estimates_by_request_id);
+    let (total_input_tokens, total_output_tokens) = cursor_request_token_totals(&requests)
+        .unwrap_or((aggregate.total_input_tokens, aggregate.total_output_tokens));
 
     (
         requests,
         aggregate.events,
-        aggregate.total_input_tokens,
-        aggregate.total_output_tokens,
+        total_input_tokens,
+        total_output_tokens,
     )
 }
 
@@ -742,7 +757,7 @@ fn build_cursor_request_estimates(
     estimates
 }
 
-fn apply_cursor_low_confidence_estimates(
+fn apply_cursor_estimates(
     requests: &mut [NormalizedRequest],
     estimates_by_request_id: &HashMap<String, CursorRequestEstimate>,
 ) {
@@ -766,8 +781,19 @@ fn apply_cursor_low_confidence_estimates(
         request.total_tokens = Some(estimate.input_tokens + estimate.output_tokens);
         request.cache_read_input_tokens = Some(0);
         request.cache_write_input_tokens = Some(0);
-        request.token_confidence = Some("low".to_string());
     }
+}
+
+fn cursor_request_token_totals(requests: &[NormalizedRequest]) -> Option<(i64, i64)> {
+    let mut input_tokens = 0_i64;
+    let mut output_tokens = 0_i64;
+
+    for request in requests {
+        input_tokens += request.input_tokens.unwrap_or(0);
+        output_tokens += request.output_tokens.unwrap_or(0);
+    }
+
+    (input_tokens > 0 || output_tokens > 0).then_some((input_tokens, output_tokens))
 }
 
 fn parse_bubble(
@@ -1288,8 +1314,8 @@ mod tests {
         .expect("insert assistant bubble");
     }
 
-    fn write_low_confidence_fixture_db(path: &Path) {
-        let conn = Connection::open(path).expect("open low confidence fixture db");
+    fn write_estimated_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open estimated fixture db");
         conn.execute_batch(
             "
             CREATE TABLE ItemTable (
@@ -1302,7 +1328,7 @@ mod tests {
             );
             ",
         )
-        .expect("create low confidence cursor schema");
+        .expect("create estimated cursor schema");
 
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
@@ -1310,8 +1336,8 @@ mod tests {
                 "composer.composerHeaders",
                 json!({
                     "allComposers": [{
-                        "composerId": "cmp_low_1",
-                        "name": "Cursor Low Session",
+                        "composerId": "cmp_estimated_1",
+                        "name": "Cursor Estimated Session",
                         "createdAt": 1_747_465_749_805_i64,
                         "lastUpdatedAt": 1_747_466_678_347_i64
                     }]
@@ -1319,15 +1345,15 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence composer headers");
+        .expect("insert estimated composer headers");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "composerData:cmp_low_1",
+                "composerData:cmp_estimated_1",
                 json!({
                     "_v": 1,
-                    "composerId": "cmp_low_1",
+                    "composerId": "cmp_estimated_1",
                     "status": "completed",
                     "fullConversationHeadersOnly": [
                         { "bubbleId": "bubble_user_1", "type": 1, "grouping": { "isRenderable": true } },
@@ -1337,12 +1363,12 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence composer");
+        .expect("insert estimated composer");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "bubbleId:cmp_low_1:bubble_user_1",
+                "bubbleId:cmp_estimated_1:bubble_user_1",
                 json!({
                     "bubbleId": "bubble_user_1",
                     "type": 1,
@@ -1352,12 +1378,12 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence user bubble");
+        .expect("insert estimated user bubble");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "bubbleId:cmp_low_1:bubble_assistant_1",
+                "bubbleId:cmp_estimated_1:bubble_assistant_1",
                 json!({
                     "bubbleId": "bubble_assistant_1",
                     "type": 2,
@@ -1372,11 +1398,11 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence assistant bubble");
+        .expect("insert estimated assistant bubble");
     }
 
-    fn write_low_confidence_tool_fixture_db(path: &Path) {
-        let conn = Connection::open(path).expect("open low confidence tool fixture db");
+    fn write_estimated_tool_fixture_db(path: &Path) {
+        let conn = Connection::open(path).expect("open estimated tool fixture db");
         conn.execute_batch(
             "
             CREATE TABLE ItemTable (
@@ -1389,7 +1415,7 @@ mod tests {
             );
             ",
         )
-        .expect("create low confidence tool cursor schema");
+        .expect("create estimated tool cursor schema");
 
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
@@ -1397,7 +1423,7 @@ mod tests {
                 "composer.composerHeaders",
                 json!({
                     "allComposers": [{
-                        "composerId": "cmp_low_tool_1",
+                        "composerId": "cmp_estimated_tool_1",
                         "name": "Cursor Tool Session",
                         "createdAt": 1_747_465_749_805_i64,
                         "lastUpdatedAt": 1_747_466_678_347_i64
@@ -1406,15 +1432,15 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence tool composer headers");
+        .expect("insert estimated tool composer headers");
 
         conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![
-                "composerData:cmp_low_tool_1",
+                "composerData:cmp_estimated_tool_1",
                 json!({
                     "_v": 1,
-                    "composerId": "cmp_low_tool_1",
+                    "composerId": "cmp_estimated_tool_1",
                     "status": "completed",
                     "fullConversationHeadersOnly": [
                         { "bubbleId": "bubble_user_1", "type": 1, "grouping": { "isRenderable": true } },
@@ -1426,7 +1452,7 @@ mod tests {
                 .to_string()
             ],
         )
-        .expect("insert low confidence tool composer");
+        .expect("insert estimated tool composer");
 
         for (bubble_id, payload) in [
             (
@@ -1476,11 +1502,11 @@ mod tests {
             conn.execute(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
                 rusqlite::params![
-                    format!("bubbleId:cmp_low_tool_1:{bubble_id}"),
+                    format!("bubbleId:cmp_estimated_tool_1:{bubble_id}"),
                     payload.to_string()
                 ],
             )
-            .expect("insert low confidence tool bubble");
+            .expect("insert estimated tool bubble");
         }
     }
 
@@ -1553,8 +1579,12 @@ mod tests {
         ));
         let global_storage = root.join("globalStorage");
         let workspace_storage = root.join("workspaceStorage").join("workspace_hash");
+        let stale_workspace_storage = root.join("workspaceStorage").join("stale_hash");
+        let nested_global_storage = root.join("workspaceStorage").join("globalStorage");
         fs::create_dir_all(&global_storage).expect("create temp cursor dir");
         fs::create_dir_all(&workspace_storage).expect("create temp cursor workspace dir");
+        fs::create_dir_all(&stale_workspace_storage).expect("create stale workspace dir");
+        fs::create_dir_all(&nested_global_storage).expect("create nested globalStorage dir");
         let db_path = global_storage.join("state.vscdb");
         let workspace_db_path = workspace_storage.join("state.vscdb");
         fs::write(&db_path, "").expect("write state db");
@@ -1653,62 +1683,68 @@ mod tests {
     }
 
     #[test]
-    fn cursor_low_confidence_estimates_stay_out_of_session_aggregates() {
-        let db_path = unique_temp_db_path("low-confidence");
-        write_low_confidence_fixture_db(&db_path);
+    fn cursor_estimates_feed_session_aggregates() {
+        let db_path = unique_temp_db_path("estimated");
+        write_estimated_fixture_db(&db_path);
 
         let sessions = CursorAdapter
             .parse(&db_path)
-            .expect("parse low confidence cursor fixture");
+            .expect("parse estimated cursor fixture");
 
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
         assert_eq!(session.requests.len(), 1);
-        assert_eq!(session.requests[0].token_confidence.as_deref(), Some("low"));
+        assert_eq!(session.requests[0].token_confidence, None);
         assert!(session.requests[0].input_tokens.unwrap_or(0) > 0);
         assert!(session.requests[0].output_tokens.unwrap_or(0) > 0);
-        assert_eq!(session.total_input_tokens, 0);
-        assert_eq!(session.total_output_tokens, 0);
+        assert_eq!(
+            session.total_input_tokens,
+            session.requests[0].input_tokens.unwrap_or(0)
+        );
+        assert_eq!(
+            session.total_output_tokens,
+            session.requests[0].output_tokens.unwrap_or(0)
+        );
         assert!(session.events.is_empty());
 
         let _ = fs::remove_file(&db_path);
     }
 
     #[test]
-    fn cursor_low_confidence_estimates_include_tool_results_as_follow_up_context() {
-        let db_path = unique_temp_db_path("low-confidence-tool");
-        write_low_confidence_tool_fixture_db(&db_path);
+    fn cursor_estimates_include_tool_results_as_follow_up_context() {
+        let db_path = unique_temp_db_path("estimated-tool");
+        write_estimated_tool_fixture_db(&db_path);
 
         let sessions = CursorAdapter
             .parse(&db_path)
-            .expect("parse low confidence cursor tool fixture");
+            .expect("parse estimated cursor tool fixture");
 
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
         assert_eq!(session.requests.len(), 1);
         let request = &session.requests[0];
-        assert_eq!(request.token_confidence.as_deref(), Some("low"));
+        assert_eq!(request.token_confidence, None);
         assert_eq!(request.input_tokens, Some(34));
         assert_eq!(request.output_tokens, Some(3));
         assert_eq!(request.total_tokens, Some(37));
-        assert_eq!(session.total_input_tokens, 0);
-        assert_eq!(session.total_output_tokens, 0);
+        assert_eq!(session.total_input_tokens, 34);
+        assert_eq!(session.total_output_tokens, 3);
         assert!(session.events.is_empty());
 
         let _ = fs::remove_file(&db_path);
     }
 
     #[test]
-    fn cursor_low_confidence_checksum_changes_with_tool_result_estimates() {
-        let db_path = unique_temp_db_path("low-confidence-tool-checksum");
-        write_low_confidence_tool_fixture_db(&db_path);
+    fn cursor_estimate_checksum_changes_with_tool_result_estimates() {
+        let db_path = unique_temp_db_path("estimated-tool-checksum");
+        write_estimated_tool_fixture_db(&db_path);
 
         let initial = CursorAdapter
             .parse(&db_path)
-            .expect("parse initial low confidence cursor tool fixture");
+            .expect("parse initial estimated cursor tool fixture");
         assert_eq!(initial[0].requests[0].input_tokens, Some(34));
 
-        let conn = Connection::open(&db_path).expect("open low confidence tool checksum db");
+        let conn = Connection::open(&db_path).expect("open estimated tool checksum db");
         conn.execute(
             "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
             rusqlite::params![
@@ -1726,14 +1762,14 @@ mod tests {
                     "tokenCount": { "inputTokens": 0, "outputTokens": 0 }
                 })
                 .to_string(),
-                "bubbleId:cmp_low_tool_1:bubble_tool_1"
+                "bubbleId:cmp_estimated_tool_1:bubble_tool_1"
             ],
         )
-        .expect("update low confidence tool result");
+        .expect("update estimated tool result");
 
         let updated = CursorAdapter
             .parse(&db_path)
-            .expect("parse updated low confidence cursor tool fixture");
+            .expect("parse updated estimated cursor tool fixture");
         assert_ne!(
             initial[0].conversation_checksum,
             updated[0].conversation_checksum

@@ -45,8 +45,7 @@ impl Repository {
         };
         let page = query.page.min(total_pages.max(1));
         let offset = (page - 1) * query.page_size;
-        let mut items = load_session_page(&conn, &query, query.page_size, offset)?;
-        apply_cursor_low_confidence_estimates_for_page(&conn, &mut items)?;
+        let items = load_session_page(&conn, &query, query.page_size, offset)?;
 
         Ok(SessionListResponse {
             items,
@@ -64,13 +63,6 @@ impl Repository {
             facets,
         })
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CursorLowConfidenceEstimate {
-    input_tokens: i64,
-    output_tokens: i64,
-    total_tokens: i64,
 }
 
 fn load_session_page(
@@ -282,87 +274,6 @@ fn map_session_list_item(row: &Row) -> rusqlite::Result<SessionListItem> {
         estimated_cost_usd: row.get(10)?,
         messages: row.get(11)?,
     })
-}
-
-fn apply_cursor_low_confidence_estimates_for_page(
-    conn: &rusqlite::Connection,
-    items: &mut [SessionListItem],
-) -> AppResult<()> {
-    let session_ids: Vec<String> = items
-        .iter()
-        .filter(|item| item.source_app == "cursor" && item.total_tokens == 0)
-        .map(|item| item.id.clone())
-        .collect();
-    if session_ids.is_empty() {
-        return Ok(());
-    }
-
-    let estimates = load_cursor_low_confidence_estimates(conn, &session_ids)?;
-    for item in items {
-        apply_cursor_low_confidence_estimate(item, &estimates);
-    }
-    Ok(())
-}
-
-fn load_cursor_low_confidence_estimates(
-    conn: &rusqlite::Connection,
-    session_ids: &[String],
-) -> AppResult<HashMap<String, CursorLowConfidenceEstimate>> {
-    let sql = format!(
-        "SELECT
-            session_id,
-            SUM(COALESCE(input_tokens, 0)),
-            SUM(COALESCE(output_tokens, 0)),
-            SUM(COALESCE(total_tokens, 0))
-         FROM session_requests
-         WHERE token_confidence = 'low'
-           AND session_id IN ({})
-         GROUP BY session_id
-         HAVING SUM(COALESCE(input_tokens, 0)) > 0
-             OR SUM(COALESCE(output_tokens, 0)) > 0",
-        sql_placeholders(session_ids.len())
-    );
-    let sql_params: Vec<rusqlite::types::Value> = session_ids
-        .iter()
-        .cloned()
-        .map(rusqlite::types::Value::Text)
-        .collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            CursorLowConfidenceEstimate {
-                input_tokens: row.get(1)?,
-                output_tokens: row.get(2)?,
-                total_tokens: row.get(3)?,
-            },
-        ))
-    })?;
-
-    let mut estimates = HashMap::new();
-    for row in rows {
-        let (session_id, estimate) = row?;
-        estimates.insert(session_id, estimate);
-    }
-    Ok(estimates)
-}
-
-fn apply_cursor_low_confidence_estimate(
-    item: &mut SessionListItem,
-    estimates: &HashMap<String, CursorLowConfidenceEstimate>,
-) {
-    if item.source_app != "cursor" || item.total_tokens != 0 {
-        return;
-    }
-
-    let Some(estimate) = estimates.get(&item.id) else {
-        return;
-    };
-
-    item.input_tokens = estimate.input_tokens;
-    item.output_tokens = estimate.output_tokens;
-    item.total_tokens = estimate.total_tokens;
-    item.token_confidence = Some("low".to_string());
 }
 
 fn normalize_session_list_query(

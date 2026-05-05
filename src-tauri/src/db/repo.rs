@@ -186,13 +186,13 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn cursor_low_confidence_session_list_falls_back_to_request_estimates() -> AppResult<()> {
-        let db_path = temp_db_path("cursor-low-confidence-session-list");
+    fn cursor_session_list_reads_estimates_from_session_token_totals() -> AppResult<()> {
+        let db_path = temp_db_path("cursor-estimated-session-list");
         let pool = init_db_with_path(&db_path)?;
         let conn = pool.get()?;
 
-        let session_id = "session-cursor-low";
-        let observation_id = "observation-cursor-low";
+        let session_id = "session-cursor-estimated";
+        let observation_id = "observation-cursor-estimated";
         let now = Utc::now();
 
         conn.execute(
@@ -213,7 +213,7 @@ mod tests {
             params![
                 session_id,
                 "cursor-external",
-                "cursor::session-cursor-low",
+                "cursor::session-cursor-estimated",
                 "Greeting in Chinese",
                 "gpt-5.5",
                 "gpt-5.5",
@@ -236,8 +236,8 @@ mod tests {
                 message_count,
                 source_model,
                 scan_run_id
-             ) VALUES (?1, ?2, ?3, 0, 0, 0, ?4, 5, 'gpt-5.5', 'scan-run-test')",
-            params![observation_id, session_id, now, "checksum-cursor-low"],
+             ) VALUES (?1, ?2, ?3, 53, 3719, 3772, ?4, 5, 'gpt-5.5', 'scan-run-test')",
+            params![observation_id, session_id, now, "checksum-cursor-estimated"],
         )?;
 
         conn.execute(
@@ -248,7 +248,7 @@ mod tests {
                 total_tokens_max,
                 last_observed_at,
                 last_observation_id
-             ) VALUES (?1, 0, 0, 0, ?2, ?3)",
+             ) VALUES (?1, 53, 3719, 3772, ?2, ?3)",
             params![session_id, now, observation_id],
         )?;
 
@@ -275,10 +275,10 @@ mod tests {
                 estimated_cost_usd
              ) VALUES (
                 ?1, ?2, ?3, 'cursor', ?4, 1, 'completed', 2, 'gpt-5.5',
-                53, 3719, 3772, 'low', ?5, ?6, '{}', 0, 0, NULL
+                53, 3719, 3772, NULL, ?5, ?6, '{}', 0, 0, NULL
              )",
             params![
-                "request-cursor-low",
+                "request-cursor-estimated",
                 session_id,
                 observation_id,
                 "request-source-id",
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(item.input_tokens, 53);
         assert_eq!(item.output_tokens, 3719);
         assert_eq!(item.total_tokens, 3772);
-        assert_eq!(item.token_confidence.as_deref(), Some("low"));
+        assert_eq!(item.token_confidence.as_deref(), Some("high"));
         assert_eq!(item.messages, 5);
 
         drop(conn);

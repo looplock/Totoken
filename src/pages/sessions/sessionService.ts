@@ -45,7 +45,6 @@ type BackendSessionListItem = {
   outputTokens: number;
   totalTokens: number;
   estimatedCostUsd: number | null;
-  tokenConfidence?: string | null;
   lastUpdated: string;
   messages: number;
   sourceState: string;
@@ -143,8 +142,6 @@ function mapSessionRecord(item: BackendSessionListItem): SessionRecord {
     outputTokens: item.outputTokens,
     totalTokens: item.totalTokens,
     estimatedCostUsd: item.estimatedCostUsd,
-    tokenConfidence:
-      item.tokenConfidence === 'low' ? 'low' : item.tokenConfidence === 'high' ? 'high' : undefined,
     lastUpdated: item.lastUpdated,
     messages: item.messages,
     sourceState: normalizeSourceState(item.sourceState),
