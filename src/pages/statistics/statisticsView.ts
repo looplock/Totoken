@@ -69,6 +69,7 @@ export const emptySummary: StatisticsSummary = {
   totalTokens: { value: 0, deltaPercent: 0 },
   inputTokens: { value: 0, deltaPercent: 0 },
   outputTokens: { value: 0, deltaPercent: 0 },
+  estimatedCostUsd: { value: 0, deltaPercent: 0 },
   totalSessions: { value: 0, deltaPercent: 0 },
   activeModels: { value: 0, deltaPercent: 0 },
   avgTokensPerSession: { value: 0, deltaPercent: 0 },

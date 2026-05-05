@@ -102,10 +102,11 @@ function buildKpi(statistics: StatisticsOverview | null): DashboardKpi {
       }
     : { value: 0, deltaPercent: null, sparkline: [] };
 
-  const todayCostValue = statistics ? sum(statistics.trend.costUsd) : 0;
   const todayCostUsd: DashboardKpiCostDelta = {
-    valueUsd: todayCostValue,
-    deltaPercent: statistics ? computeSparklineDeltaPercent(statistics.trend.costUsd) : null,
+    valueUsd: statistics?.summary.estimatedCostUsd.value ?? 0,
+    deltaPercent: statistics
+      ? normalizeDelta(statistics.summary.estimatedCostUsd.deltaPercent)
+      : null,
     sparkline: statistics?.trend.costUsd ?? [],
   };
 
@@ -126,23 +127,6 @@ function buildSessionSparkline(statistics: StatisticsOverview): number[] {
     const hourIndex = date.getHours();
     return matrix[dayIndex]?.[hourIndex] ?? 0;
   });
-}
-
-function computeSparklineDeltaPercent(values: number[]): number | null {
-  const finiteValues = values.filter((value) => Number.isFinite(value));
-  if (finiteValues.length === 0) {
-    return null;
-  }
-
-  const midpoint = Math.max(1, Math.floor(finiteValues.length / 2));
-  const previous = sum(finiteValues.slice(0, midpoint));
-  const current = sum(finiteValues.slice(midpoint));
-
-  if (previous <= 0) {
-    return current > 0 ? 100 : 0;
-  }
-
-  return ((current - previous) / previous) * 100;
 }
 
 function buildTrend(statistics: StatisticsOverview): DashboardTrendPoint[] {
@@ -201,12 +185,4 @@ function finishTop(tally: Map<string, number>, total: number): DashboardTopRow[]
     value,
     share: value / total,
   }));
-}
-
-function sum(values: number[]): number {
-  let acc = 0;
-  for (const value of values) {
-    if (Number.isFinite(value)) acc += value;
-  }
-  return acc;
 }

@@ -9,10 +9,16 @@ export type StatisticsMetricValue = {
   deltaPercent: number;
 };
 
+export type StatisticsCostMetricValue = {
+  value: number;
+  deltaPercent: number;
+};
+
 export type StatisticsSummary = {
   totalTokens: StatisticsMetricValue;
   inputTokens: StatisticsMetricValue;
   outputTokens: StatisticsMetricValue;
+  estimatedCostUsd: StatisticsCostMetricValue;
   totalSessions: StatisticsMetricValue;
   activeModels: StatisticsMetricValue;
   avgTokensPerSession: StatisticsMetricValue;

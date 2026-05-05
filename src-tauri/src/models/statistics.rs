@@ -22,10 +22,18 @@ pub struct StatisticsMetricValue {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct StatisticsCostMetricValue {
+    pub value: f64,
+    pub delta_percent: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct StatisticsSummary {
     pub total_tokens: StatisticsMetricValue,
     pub input_tokens: StatisticsMetricValue,
     pub output_tokens: StatisticsMetricValue,
+    pub estimated_cost_usd: StatisticsCostMetricValue,
     pub total_sessions: StatisticsMetricValue,
     pub active_models: StatisticsMetricValue,
     pub avg_tokens_per_session: StatisticsMetricValue,

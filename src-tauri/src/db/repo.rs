@@ -7,8 +7,9 @@ use crate::models::{
     MessageUsageEventItem, ScanRecordsListQuery, ScanRecordsListResponse, ScanRunListItem,
     SessionFacetItem, SessionFacets, SessionListItem, SessionListPagination, SessionListQuery,
     SessionListResponse, SessionListSummary, StatisticsActivity, StatisticsActivityMetric,
-    StatisticsDetailRow, StatisticsDistributionRow, StatisticsMetricValue, StatisticsOverview,
-    StatisticsQuery, StatisticsRange, StatisticsSummary, StatisticsTrend,
+    StatisticsCostMetricValue, StatisticsDetailRow, StatisticsDistributionRow,
+    StatisticsMetricValue, StatisticsOverview, StatisticsQuery, StatisticsRange, StatisticsSummary,
+    StatisticsTrend,
 };
 use crate::pricing::{estimate_usage_cost, ModelPricing};
 use chrono::{
@@ -96,6 +97,7 @@ struct StatisticsSummaryAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
+    estimated_cost_usd: f64,
     sessions: BTreeSet<String>,
     models: BTreeSet<String>,
 }
@@ -176,7 +178,9 @@ fn normalize_source_state(value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::statistics::{build_statistics_activity, build_statistics_distribution};
+    use super::statistics::{
+        build_statistics_activity, build_statistics_distribution, build_statistics_summary,
+    };
     use super::*;
     use crate::db::init_db_with_path;
     use chrono::{Duration, Utc};
@@ -610,6 +614,40 @@ mod tests {
         assert_eq!(activity.sessions.max_value, 2.0);
         assert_eq!(activity.tokens.max_value, 200.0);
         assert!((activity.cost.max_value - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn statistics_summary_compares_estimated_cost_to_previous_period() {
+        let event_time = Utc::now();
+        let current_events = vec![StatisticsEventRecord {
+            session_id: "session-current".to_string(),
+            event_time_utc: event_time,
+            source_app: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            delta_input: 400,
+            delta_output: 600,
+            delta_total: 1000,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            estimated_cost_usd: Some(14.0),
+        }];
+        let previous_events = vec![StatisticsEventRecord {
+            session_id: "session-previous".to_string(),
+            event_time_utc: event_time - Duration::days(1),
+            source_app: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            delta_input: 100,
+            delta_output: 200,
+            delta_total: 300,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            estimated_cost_usd: Some(1.0),
+        }];
+
+        let summary = build_statistics_summary(&current_events, &previous_events);
+
+        assert!((summary.estimated_cost_usd.value - 14.0).abs() < 1e-9);
+        assert_eq!(summary.estimated_cost_usd.delta_percent, 1300.0);
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub use sessions::{
     SessionListQuery, SessionListResponse, SessionListSummary, TokenUsageEvent,
 };
 pub use statistics::{
-    StatisticsActivity, StatisticsActivityMetric, StatisticsDetailRow, StatisticsDistributionRow,
-    StatisticsMetricValue, StatisticsOverview, StatisticsQuery, StatisticsRange, StatisticsSummary,
-    StatisticsTrend,
+    StatisticsActivity, StatisticsActivityMetric, StatisticsCostMetricValue, StatisticsDetailRow,
+    StatisticsDistributionRow, StatisticsMetricValue, StatisticsOverview, StatisticsQuery,
+    StatisticsRange, StatisticsSummary, StatisticsTrend,
 };
