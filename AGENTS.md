@@ -17,3 +17,4 @@
 
 - Git branch create/switch operations may need escalated permission first; request approval before retrying.
 - If PowerShell displays UTF-8 source text as mojibake, verify with a UTF-8 reader before assuming the file is corrupted.
+- run `pnpm format:check` after TS/TSX/i18n edits and format before pushing.
