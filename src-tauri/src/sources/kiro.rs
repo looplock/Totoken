@@ -122,7 +122,7 @@ impl SourceAdapter for KiroAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        7
+        9
     }
 
     fn can_handle(&self, path: &Path) -> bool {
@@ -356,14 +356,11 @@ impl SourceAdapter for KiroAdapter {
 
         let source_created_at = session_index.and_then(|entry| entry.source_created_at);
         let message_count = messages.len() as i64;
-        let mut aggregate = build_message_stream_aggregation(
+        let aggregate = build_message_stream_aggregation(
             messages,
             &session_model,
             source_updated_at.or(source_created_at),
         );
-        aggregate.events.clear();
-        aggregate.total_input_tokens = 0;
-        aggregate.total_output_tokens = 0;
         let latest_request_updated_at = aggregate
             .requests
             .iter()
@@ -1604,10 +1601,10 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("First prompt"));
         assert_eq!(session.model_first.as_deref(), Some("claude-sonnet-4.5"));
         assert_eq!(session.message_count, 4);
-        assert_eq!(session.total_input_tokens, 0);
-        assert_eq!(session.total_output_tokens, 0);
+        assert!(session.total_input_tokens > 0);
+        assert!(session.total_output_tokens > 0);
         assert_eq!(session.requests.len(), 2);
-        assert!(session.events.is_empty());
+        assert_eq!(session.events.len(), 2);
         assert_eq!(
             session.requests[0].source_request_id.as_deref(),
             Some("exec-1")
@@ -1714,7 +1711,7 @@ mod tests {
         assert_eq!(session.requests[0].message_count, 2);
         assert_eq!(session.requests[1].message_count, 2);
         assert_eq!(session.requests[2].message_count, 2);
-        assert!(session.events.is_empty());
+        assert_eq!(session.events.len(), 3);
         assert!(session
             .requests
             .iter()
@@ -1849,7 +1846,10 @@ mod tests {
                 .map(|value| value.timestamp_millis()),
             Some(1775460802816)
         );
-        assert!(session.events.is_empty());
+        assert_eq!(
+            session.events[0].event_time_utc.timestamp_millis(),
+            1775460802816
+        );
         assert!(session.requests[0].output_tokens.unwrap_or(0) > 10);
 
         let fingerprints = adapter.fingerprint_paths(&path);
@@ -2006,8 +2006,7 @@ mod tests {
         );
         assert_eq!(session.requests[0].input_tokens.unwrap_or(0), 10);
         assert!(session.requests[0].output_tokens.unwrap_or(0) > 40);
-        assert_eq!(session.total_input_tokens, 0);
-        assert_eq!(session.total_output_tokens, 0);
+        assert!(session.total_output_tokens > session.total_input_tokens);
     }
 
     #[test]
@@ -2171,7 +2170,15 @@ mod tests {
                 .map(|value| value.timestamp_millis()),
             Some(1775461009000)
         );
-        assert!(session.events.is_empty());
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(
+            session.events[0].event_time_utc.timestamp_millis(),
+            1775461001000
+        );
+        assert_eq!(
+            session.events[1].event_time_utc.timestamp_millis(),
+            1775461009000
+        );
     }
 
     #[test]

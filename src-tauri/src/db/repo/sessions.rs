@@ -7,6 +7,9 @@ const SESSION_SOURCE_STATE_SQL: &str =
     "CASE s.source_state WHEN 'active' THEN 'synced' WHEN 'deleted_by_user' THEN 'deleted' ELSE s.source_state END";
 const SESSION_ESTIMATED_COST_SQL: &str =
     "(SELECT SUM(r.estimated_cost_usd) FROM session_requests r WHERE r.session_id = s.id)";
+const SESSION_LIST_INPUT_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.input_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.input_tokens, 0)), 0) FROM session_requests r WHERE r.session_id = s.id) END";
+const SESSION_LIST_OUTPUT_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.output_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.output_tokens, 0)), 0) FROM session_requests r WHERE r.session_id = s.id) END";
+const SESSION_LIST_TOTAL_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.total_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.total_tokens, COALESCE(r.input_tokens, 0) + COALESCE(r.output_tokens, 0) + COALESCE(r.cache_read_input_tokens, 0) + COALESCE(r.cache_write_input_tokens, 0))), 0) FROM session_requests r WHERE r.session_id = s.id) END";
 const HIDE_CURSOR_WORKSPACE_EMPTY_SHELL_SQL: &str = "
     NOT (
         s.source_app = 'cursor'
@@ -28,7 +31,18 @@ const HIDE_CURSOR_WORKSPACE_EMPTY_SHELL_SQL: &str = "
         AND NOT EXISTS (
             SELECT 1 FROM session_token_totals totals
             WHERE totals.session_id = s.id
-              AND COALESCE(totals.total_tokens_max, 0) > 0
+              AND (
+                COALESCE(totals.total_tokens_max, 0) > 0
+                OR EXISTS (
+                    SELECT 1 FROM session_requests request_totals
+                    WHERE request_totals.session_id = s.id
+                      AND (
+                        COALESCE(request_totals.total_tokens, 0) > 0
+                        OR COALESCE(request_totals.input_tokens, 0) > 0
+                        OR COALESCE(request_totals.output_tokens, 0) > 0
+                      )
+                )
+              )
         )
     )";
 
@@ -81,10 +95,10 @@ fn load_session_page(
             {SESSION_MODEL_SQL},
             {SESSION_LAST_UPDATED_SQL},
             {SESSION_SOURCE_STATE_SQL},
-            COALESCE(st.input_tokens_max, 0),
-            COALESCE(st.output_tokens_max, 0),
-            COALESCE(st.total_tokens_max, 0),
-            CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN 'high' ELSE NULL END,
+            {SESSION_LIST_INPUT_TOKENS_SQL},
+            {SESSION_LIST_OUTPUT_TOKENS_SQL},
+            {SESSION_LIST_TOTAL_TOKENS_SQL},
+            NULL,
             {SESSION_ESTIMATED_COST_SQL},
             COALESCE(obs.message_count, 0)
          FROM sessions s
@@ -238,13 +252,13 @@ fn session_order_clause(query: &NormalizedSessionListQuery) -> String {
         "sourceApp" => format!("s.source_app {direction}, s.id {direction}"),
         "model" => format!("{SESSION_MODEL_SQL} {direction}, s.id {direction}"),
         "inputTokens" => {
-            format!("COALESCE(st.input_tokens_max, 0) {direction}, s.id {direction}")
+            format!("{SESSION_LIST_INPUT_TOKENS_SQL} {direction}, s.id {direction}")
         }
         "outputTokens" => {
-            format!("COALESCE(st.output_tokens_max, 0) {direction}, s.id {direction}")
+            format!("{SESSION_LIST_OUTPUT_TOKENS_SQL} {direction}, s.id {direction}")
         }
         "totalTokens" => {
-            format!("COALESCE(st.total_tokens_max, 0) {direction}, s.id {direction}")
+            format!("{SESSION_LIST_TOTAL_TOKENS_SQL} {direction}, s.id {direction}")
         }
         "estimatedCostUsd" if query.sort_order == "desc" => {
             format!(

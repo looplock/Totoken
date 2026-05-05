@@ -302,8 +302,100 @@ mod tests {
         assert_eq!(item.input_tokens, 53);
         assert_eq!(item.output_tokens, 3719);
         assert_eq!(item.total_tokens, 3772);
-        assert_eq!(item.token_confidence.as_deref(), Some("high"));
+        assert_eq!(item.token_confidence, None);
         assert_eq!(item.messages, 5);
+
+        drop(conn);
+        drop(pool);
+        cleanup_temp_db(&db_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn session_list_falls_back_to_request_tokens_when_totals_are_stale() -> AppResult<()> {
+        let db_path = temp_db_path("stale-session-token-totals");
+        let pool = init_db_with_path(&db_path)?;
+        let conn = pool.get()?;
+
+        let session_id = "session-kiro-stale-totals";
+        let observation_id = "observation-kiro-stale-totals";
+        let now = Utc::now();
+
+        conn.execute(
+            "INSERT INTO sessions (
+                id, source_app, external_session_id, session_key, title,
+                model_first, model_last, source_created_at, source_updated_at,
+                discovered_first_at, discovered_last_at, source_state
+             ) VALUES (?1, 'kiro', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'synced')",
+            params![
+                session_id,
+                "kiro-external",
+                "kiro::session-stale-totals",
+                "Kiro stale totals",
+                "claude-sonnet-4",
+                "claude-sonnet-4",
+                now,
+                now,
+                now,
+                now,
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO session_observations (
+                id, session_id, observed_at, input_tokens, output_tokens, total_tokens,
+                conversation_checksum, message_count, source_model, scan_run_id
+             ) VALUES (?1, ?2, ?3, 0, 0, 0, ?4, 2, 'claude-sonnet-4', 'scan-run-test')",
+            params![
+                observation_id,
+                session_id,
+                now,
+                "checksum-kiro-stale-totals"
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO session_token_totals (
+                session_id, input_tokens_max, output_tokens_max, total_tokens_max,
+                last_observed_at, last_observation_id
+             ) VALUES (?1, 0, 0, 0, ?2, ?3)",
+            params![session_id, now, observation_id],
+        )?;
+
+        conn.execute(
+            "INSERT INTO session_requests (
+                id, session_id, observation_id, source_app, source_request_id,
+                sequence_no, status, message_count, model, input_tokens, output_tokens,
+                total_tokens, token_confidence, source_created_at, source_updated_at,
+                source_locator, cache_read_input_tokens, cache_write_input_tokens,
+                estimated_cost_usd
+             ) VALUES (
+                ?1, ?2, ?3, 'kiro', ?4, 1, 'completed', 2, 'claude-sonnet-4',
+                120, 340, 460, 'low', ?5, ?6, '{}', 0, 0, NULL
+             )",
+            params![
+                "request-kiro-stale-totals",
+                session_id,
+                observation_id,
+                "request-source-id",
+                now,
+                now,
+            ],
+        )?;
+
+        let repository = Repository::new(pool.clone());
+        let response = repository.sessions_list(None)?;
+        let item = response
+            .items
+            .into_iter()
+            .find(|item| item.id == session_id)
+            .expect("session should be returned");
+
+        assert_eq!(item.input_tokens, 120);
+        assert_eq!(item.output_tokens, 340);
+        assert_eq!(item.total_tokens, 460);
+        assert_eq!(item.token_confidence, None);
 
         drop(conn);
         drop(pool);

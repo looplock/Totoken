@@ -301,12 +301,14 @@ impl Scanner {
             )
             .optional()?;
 
+        let mut force_rebuild_message_index = false;
         let cache_id = if let Some((cache_id, cached_fast, cached_parser_version)) = existing_cache
         {
             if cached_fast == fast_fingerprint.fast && cached_parser_version == parser_version {
                 *files_skipped += 1;
                 return Ok(());
             }
+            force_rebuild_message_index = true;
 
             tx.execute(
                 "UPDATE source_files_cache
@@ -354,7 +356,7 @@ impl Scanner {
                         abs_path,
                         &cache_id,
                         scan_run_id,
-                        false,
+                        force_rebuild_message_index,
                     ) {
                         Ok(changed) => {
                             if changed {
@@ -841,7 +843,6 @@ fn normalized_session_token_totals(session: &NormalizedSession) -> NormalizedSes
     let request_total_tokens: i64 = session
         .requests
         .iter()
-        .filter(|request| request_counts_toward_session_totals(&session.source_app, request))
         .map(|request| {
             request_input_tokens += request.input_tokens.unwrap_or(0);
             request_output_tokens += request.output_tokens.unwrap_or(0);
@@ -860,16 +861,6 @@ fn normalized_session_token_totals(session: &NormalizedSession) -> NormalizedSes
             output_tokens: request_output_tokens,
             total_tokens: request_total_tokens,
         }
-    } else if session
-        .requests
-        .iter()
-        .any(|request| low_confidence_excluded_from_totals(&session.source_app, request))
-    {
-        NormalizedSessionTokenTotals {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-        }
     } else {
         NormalizedSessionTokenTotals {
             input_tokens: session.total_input_tokens,
@@ -877,20 +868,6 @@ fn normalized_session_token_totals(session: &NormalizedSession) -> NormalizedSes
             total_tokens: session.total_input_tokens + session.total_output_tokens,
         }
     }
-}
-
-fn request_counts_toward_session_totals(
-    source_app: &str,
-    request: &crate::sources::NormalizedRequest,
-) -> bool {
-    !low_confidence_excluded_from_totals(source_app, request)
-}
-
-fn low_confidence_excluded_from_totals(
-    source_app: &str,
-    request: &crate::sources::NormalizedRequest,
-) -> bool {
-    source_app == "kiro" && request.token_confidence.as_deref() != Some("high")
 }
 
 fn preview_session_merge(
@@ -1004,6 +981,29 @@ mod tests {
         }
     }
 
+    struct FixedSessionAdapter {
+        session: NormalizedSession,
+        parser_version: i64,
+    }
+
+    impl SourceAdapter for FixedSessionAdapter {
+        fn name(&self) -> &str {
+            "kiro"
+        }
+
+        fn parser_version(&self) -> i64 {
+            self.parser_version
+        }
+
+        fn can_handle(&self, path: &Path) -> bool {
+            path.is_file()
+        }
+
+        fn parse(&self, _path: &Path) -> AppResult<Vec<NormalizedSession>> {
+            Ok(vec![self.session.clone()])
+        }
+    }
+
     fn make_session(
         session_key: &str,
         checksum: &str,
@@ -1101,6 +1101,120 @@ mod tests {
         assert_eq!(fingerprint_strong, None);
 
         let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn parser_version_reparse_rebuilds_existing_session_token_totals() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-parser-rebuild-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let source_path = std::env::temp_dir().join(format!(
+            "totoken-scanner-parser-rebuild-source-{}.json",
+            crate::utils::ids::new_uuid()
+        ));
+        std::fs::write(&source_path, r#"{"history":[]}"#).expect("write source file");
+        let pool = init_db_with_path(&db_path).expect("init test db");
+        let conn = pool.get().expect("load db conn");
+        let now = Utc::now();
+        let session_id = "session-parser-rebuild";
+        let observation_id = "observation-parser-rebuild";
+        let source_file_id = "source-file-parser-rebuild";
+        let source_path_text = source_path.to_string_lossy().to_string();
+
+        conn.execute(
+            "INSERT INTO sessions (
+                id, source_app, external_session_id, session_key, title,
+                model_first, model_last, source_created_at, source_updated_at,
+                discovered_first_at, discovered_last_at, source_state
+             ) VALUES (?1, 'kiro', 'external-parser-rebuild', 'kiro:parser-rebuild',
+                'Parser rebuild', 'claude-sonnet-4', 'claude-sonnet-4',
+                ?2, ?2, ?2, ?2, 'synced')",
+            rusqlite::params![session_id, now],
+        )
+        .expect("insert existing session");
+        conn.execute(
+            "INSERT INTO session_observations (
+                id, session_id, observed_at, input_tokens, output_tokens, total_tokens,
+                conversation_checksum, message_count, source_model, scan_run_id
+             ) VALUES (?1, ?2, ?3, 0, 0, 0, 'checksum-parser-rebuild', 2,
+                'claude-sonnet-4', 'scan-run-old')",
+            rusqlite::params![observation_id, session_id, now],
+        )
+        .expect("insert existing observation");
+        conn.execute(
+            "INSERT INTO session_token_totals (
+                session_id, input_tokens_max, output_tokens_max, total_tokens_max,
+                last_observed_at, last_observation_id
+             ) VALUES (?1, 0, 0, 0, ?2, ?3)",
+            rusqlite::params![session_id, now, observation_id],
+        )
+        .expect("insert stale token totals");
+        conn.execute(
+            "INSERT INTO source_files_cache (
+                id, abs_path, size_bytes, mtime_ms, fingerprint_fast, fingerprint_strong,
+                parser_version, last_scan_at, last_parse_status
+             ) VALUES (?1, ?2, 1, 1, 'stale-fast-fingerprint', NULL, 1, ?3, 'parsed')",
+            rusqlite::params![source_file_id, source_path_text, now],
+        )
+        .expect("insert stale source cache");
+        drop(conn);
+
+        let mut session = make_session("kiro:parser-rebuild", "checksum-parser-rebuild", 0, 0);
+        session.message_count = 2;
+        session.requests = vec![make_request(1, 120, 340, 460, 0)];
+        let adapter = FixedSessionAdapter {
+            session,
+            parser_version: 2,
+        };
+        let scanner = Scanner::new(pool.clone());
+        let mut files_parsed = 0;
+        let mut files_skipped = 0;
+        let mut files_failed = 0;
+        let mut sessions_changed = 0;
+        let mut error_count = 0;
+
+        scanner
+            .process_source_file(
+                &adapter,
+                &source_path,
+                &source_path_text,
+                None,
+                &mut files_parsed,
+                &mut files_skipped,
+                &mut files_failed,
+                &mut sessions_changed,
+                &mut error_count,
+            )
+            .expect("process source file");
+
+        let conn = pool.get().expect("load db conn");
+        let totals = conn
+            .query_row(
+                "SELECT input_tokens_max, output_tokens_max, total_tokens_max
+                 FROM session_token_totals WHERE session_id = ?",
+                rusqlite::params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("load rebuilt totals");
+        assert_eq!(totals, (120, 340, 460));
+        assert_eq!(files_parsed, 1);
+        assert_eq!(files_skipped, 0);
+        assert_eq!(files_failed, 0);
+        assert_eq!(error_count, 0);
+
+        let _ = std::fs::remove_file(&source_path);
+        drop(conn);
+        drop(pool);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
@@ -1369,19 +1483,19 @@ mod tests {
     }
 
     #[test]
-    fn kiro_low_confidence_requests_do_not_feed_session_totals() {
+    fn kiro_estimated_requests_feed_session_totals() {
         let db_path = std::env::temp_dir().join(format!(
-            "totoken-scanner-kiro-low-{}.db",
+            "totoken-scanner-kiro-estimated-{}.db",
             crate::utils::ids::new_uuid()
         ));
         let pool = init_db_with_path(&db_path).expect("init test db");
         let scanner = Scanner::new(pool.clone());
 
         let now = Utc::now();
-        let mut session = make_session("kiro:low", "kiro-low-checksum", 0, 0);
+        let mut session = make_session("kiro:estimated", "kiro-estimated-checksum", 0, 0);
         session.message_count = 2;
         session.requests = vec![NormalizedRequest {
-            source_request_id: Some("kiro-low-request-1".to_string()),
+            source_request_id: Some("kiro-estimated-request-1".to_string()),
             sequence_no: 1,
             status: Some("completed".to_string()),
             message_count: 2,
@@ -1404,7 +1518,7 @@ mod tests {
                 "source-file-1",
                 false,
             )
-            .expect("insert low confidence kiro session");
+            .expect("insert estimated kiro session");
 
         let conn = pool.get().expect("load db conn");
         let totals = conn
@@ -1421,7 +1535,7 @@ mod tests {
                 },
             )
             .expect("load totals");
-        assert_eq!(totals, (0, 0, 0));
+        assert_eq!(totals, (120, 340, 460));
 
         let request_totals = conn
             .query_row(
