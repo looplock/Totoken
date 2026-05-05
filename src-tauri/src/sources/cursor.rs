@@ -573,9 +573,7 @@ fn build_workspace_metadata_session(
     composer_id: &str,
     header: &CursorComposerHeader,
 ) -> Option<NormalizedSession> {
-    if header.title.is_none() {
-        return None;
-    }
+    header.title.as_ref()?;
 
     let checksum_parts = [
         "workspace-metadata",
