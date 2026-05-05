@@ -80,7 +80,7 @@ struct KiroChatIndex {
 struct KiroChatIndexCacheEntry {
     index: Arc<KiroChatIndex>,
     watch_states: Vec<KiroPathState>,
-    snapshot_states: Vec<KiroPathState>,
+    snapshot_states: HashMap<PathBuf, KiroPathState>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,7 +122,7 @@ impl SourceAdapter for KiroAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        6
+        7
     }
 
     fn can_handle(&self, path: &Path) -> bool {
@@ -131,11 +131,11 @@ impl SourceAdapter for KiroAdapter {
 
     fn discover_paths(&self, root_path: &Path) -> AppResult<Vec<PathBuf>> {
         if root_path.is_file() {
-            return Ok(self
-                .can_handle(root_path)
-                .then(|| root_path.to_path_buf())
-                .into_iter()
-                .collect());
+            return Ok((self.can_handle(root_path)
+                && is_discoverable_kiro_workspace_session_file(root_path))
+            .then(|| root_path.to_path_buf())
+            .into_iter()
+            .collect());
         }
 
         let mut paths = Vec::new();
@@ -149,7 +149,7 @@ impl SourceAdapter for KiroAdapter {
                 }
 
                 let path = entry.into_path();
-                if self.can_handle(&path) {
+                if self.can_handle(&path) && is_discoverable_kiro_workspace_session_file(&path) {
                     paths.push(path);
                 }
             }
@@ -169,7 +169,9 @@ impl SourceAdapter for KiroAdapter {
             resolve_kiro_storage_root(path),
             collect_workspace_execution_ids(path),
         ) {
-            if let Ok(chat_index) = self.load_kiro_chat_index(&storage_root) {
+            if let Ok(chat_index) =
+                self.load_kiro_chat_index_for_executions(&storage_root, &execution_ids)
+            {
                 for execution_id in execution_ids {
                     if let Some(summary) = chat_index.executions.get(&execution_id) {
                         paths.extend(summary.chat_paths.iter().cloned());
@@ -195,8 +197,14 @@ impl SourceAdapter for KiroAdapter {
             .get("history")
             .and_then(Value::as_array)
             .ok_or_else(|| AppError::validation("Kiro session file is missing history[]"))?;
+        if !kiro_document_has_conversation(&document) {
+            return Ok(Vec::new());
+        }
+        let execution_ids = collect_workspace_execution_ids_from_history(history);
         let chat_index = resolve_kiro_storage_root(path)
-            .map(|storage_root| self.load_kiro_chat_index(&storage_root))
+            .map(|storage_root| {
+                self.load_kiro_chat_index_for_executions(&storage_root, &execution_ids)
+            })
             .transpose()?;
 
         let session_id = document
@@ -342,13 +350,20 @@ impl SourceAdapter for KiroAdapter {
             });
         }
 
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let source_created_at = session_index.and_then(|entry| entry.source_created_at);
         let message_count = messages.len() as i64;
-        let aggregate = build_message_stream_aggregation(
+        let mut aggregate = build_message_stream_aggregation(
             messages,
             &session_model,
             source_updated_at.or(source_created_at),
         );
+        aggregate.events.clear();
+        aggregate.total_input_tokens = 0;
+        aggregate.total_output_tokens = 0;
         let latest_request_updated_at = aggregate
             .requests
             .iter()
@@ -390,8 +405,12 @@ impl SourceAdapter for KiroAdapter {
 }
 
 impl KiroAdapter {
-    fn load_kiro_chat_index(&self, root: &Path) -> AppResult<Arc<KiroChatIndex>> {
-        load_kiro_chat_index(root, &self.chat_index_cache)
+    fn load_kiro_chat_index_for_executions(
+        &self,
+        root: &Path,
+        execution_ids: &[String],
+    ) -> AppResult<Arc<KiroChatIndex>> {
+        load_kiro_chat_index_for_executions(root, execution_ids, &self.chat_index_cache)
     }
 }
 
@@ -621,6 +640,44 @@ fn is_kiro_workspace_session_path(path: &Path) -> bool {
         && path_has_component(path, "workspace-sessions")
 }
 
+fn is_discoverable_kiro_workspace_session_file(path: &Path) -> bool {
+    if !is_kiro_workspace_session_path(path) {
+        return false;
+    }
+
+    let Ok(content) = fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&content) else {
+        return true;
+    };
+
+    kiro_document_has_conversation(&document)
+}
+
+fn kiro_document_has_conversation(document: &Value) -> bool {
+    let Some(history) = document.get("history").and_then(Value::as_array) else {
+        return false;
+    };
+
+    history.iter().any(|entry| {
+        let message = entry.get("message").unwrap_or(&Value::Null);
+        let role = message.get("role").and_then(Value::as_str);
+        if !matches!(role, Some("user" | "assistant")) {
+            return false;
+        }
+
+        let has_message_text =
+            extract_kiro_message_text(message.get("content").unwrap_or(&Value::Null)).is_some();
+        let has_prompt_log = extract_prompt_logs_prompt(entry).is_some()
+            || extract_prompt_logs_completion(entry).is_some();
+        let has_execution_id =
+            normalize_optional_text(entry.get("executionId").and_then(Value::as_str)).is_some();
+
+        has_message_text || has_prompt_log || has_execution_id
+    })
+}
+
 fn path_has_component(path: &Path, expected: &str) -> bool {
     path.components().any(|component| {
         component
@@ -693,6 +750,10 @@ fn collect_workspace_execution_ids(path: &Path) -> Option<Vec<String>> {
     let content = fs::read_to_string(path).ok()?;
     let document: Value = serde_json::from_str(&content).ok()?;
     let history = document.get("history").and_then(Value::as_array)?;
+    Some(collect_workspace_execution_ids_from_history(history))
+}
+
+fn collect_workspace_execution_ids_from_history(history: &[Value]) -> Vec<String> {
     let mut execution_ids = history
         .iter()
         .filter_map(|entry| {
@@ -701,24 +762,13 @@ fn collect_workspace_execution_ids(path: &Path) -> Option<Vec<String>> {
         .collect::<Vec<_>>();
     execution_ids.sort();
     execution_ids.dedup();
-    Some(execution_ids)
+    execution_ids
 }
 
-fn load_kiro_chat_index(
+fn load_kiro_chat_index_uncached(
     root: &Path,
     cache: &Mutex<BoundedCache<PathBuf, KiroChatIndexCacheEntry>>,
 ) -> AppResult<Arc<KiroChatIndex>> {
-    {
-        let mut guard = cache
-            .lock()
-            .map_err(|_| AppError::internal("Kiro chat index cache lock poisoned"))?;
-        if let Some(entry) = guard.get_cloned(&root.to_path_buf()) {
-            if kiro_chat_index_cache_is_fresh(&entry) {
-                return Ok(entry.index.clone());
-            }
-        }
-    }
-
     let entry = build_kiro_chat_index_cache_entry(root)?;
     let mut guard = cache
         .lock()
@@ -729,6 +779,25 @@ fn load_kiro_chat_index(
         .map(|cached| cached.index)
         .expect("kiro chat index cache entry inserted");
     Ok(cached)
+}
+
+fn load_kiro_chat_index_for_executions(
+    root: &Path,
+    execution_ids: &[String],
+    cache: &Mutex<BoundedCache<PathBuf, KiroChatIndexCacheEntry>>,
+) -> AppResult<Arc<KiroChatIndex>> {
+    {
+        let mut guard = cache
+            .lock()
+            .map_err(|_| AppError::internal("Kiro chat index cache lock poisoned"))?;
+        if let Some(entry) = guard.get_cloned(&root.to_path_buf()) {
+            if kiro_chat_index_cache_is_fresh_for_executions(&entry, execution_ids) {
+                return Ok(entry.index.clone());
+            }
+        }
+    }
+
+    load_kiro_chat_index_uncached(root, cache)
 }
 
 fn build_kiro_chat_index_cache_entry(root: &Path) -> AppResult<KiroChatIndexCacheEntry> {
@@ -822,19 +891,38 @@ fn build_kiro_chat_index_cache_entry(root: &Path) -> AppResult<KiroChatIndexCach
         snapshot_states: snapshot_paths
             .iter()
             .map(|path| capture_kiro_path_state(path))
+            .map(|state| (state.path.clone(), state))
             .collect(),
     })
 }
 
-fn kiro_chat_index_cache_is_fresh(entry: &KiroChatIndexCacheEntry) -> bool {
+fn kiro_chat_index_cache_is_fresh_for_executions(
+    entry: &KiroChatIndexCacheEntry,
+    execution_ids: &[String],
+) -> bool {
+    if !kiro_chat_index_watch_paths_are_fresh(entry) {
+        return false;
+    }
+
+    execution_ids.iter().all(|execution_id| {
+        let Some(summary) = entry.index.executions.get(execution_id) else {
+            return true;
+        };
+
+        summary.chat_paths.iter().all(|path| {
+            entry
+                .snapshot_states
+                .get(path)
+                .is_some_and(|state| *state == capture_kiro_path_state(path))
+        })
+    })
+}
+
+fn kiro_chat_index_watch_paths_are_fresh(entry: &KiroChatIndexCacheEntry) -> bool {
     entry
         .watch_states
         .iter()
         .all(|state| *state == capture_kiro_path_state(&state.path))
-        && entry
-            .snapshot_states
-            .iter()
-            .all(|state| *state == capture_kiro_path_state(&state.path))
 }
 
 fn capture_kiro_path_state(path: &Path) -> KiroPathState {
@@ -860,10 +948,6 @@ fn resolve_kiro_snapshot_roots(root: &Path) -> Vec<PathBuf> {
         if candidate.exists() {
             roots.push(candidate);
         }
-    }
-
-    if roots.is_empty() {
-        roots.push(root.to_path_buf());
     }
 
     roots
@@ -1520,10 +1604,10 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("First prompt"));
         assert_eq!(session.model_first.as_deref(), Some("claude-sonnet-4.5"));
         assert_eq!(session.message_count, 4);
-        assert!(session.total_input_tokens > 0);
-        assert!(session.total_output_tokens > 0);
+        assert_eq!(session.total_input_tokens, 0);
+        assert_eq!(session.total_output_tokens, 0);
         assert_eq!(session.requests.len(), 2);
-        assert_eq!(session.events.len(), 2);
+        assert!(session.events.is_empty());
         assert_eq!(
             session.requests[0].source_request_id.as_deref(),
             Some("exec-1")
@@ -1630,7 +1714,7 @@ mod tests {
         assert_eq!(session.requests[0].message_count, 2);
         assert_eq!(session.requests[1].message_count, 2);
         assert_eq!(session.requests[2].message_count, 2);
-        assert_eq!(session.events.len(), 3);
+        assert!(session.events.is_empty());
         assert!(session
             .requests
             .iter()
@@ -1765,10 +1849,7 @@ mod tests {
                 .map(|value| value.timestamp_millis()),
             Some(1775460802816)
         );
-        assert_eq!(
-            session.events[0].event_time_utc.timestamp_millis(),
-            1775460802816
-        );
+        assert!(session.events.is_empty());
         assert!(session.requests[0].output_tokens.unwrap_or(0) > 10);
 
         let fingerprints = adapter.fingerprint_paths(&path);
@@ -1925,7 +2006,8 @@ mod tests {
         );
         assert_eq!(session.requests[0].input_tokens.unwrap_or(0), 10);
         assert!(session.requests[0].output_tokens.unwrap_or(0) > 40);
-        assert!(session.total_output_tokens > session.total_input_tokens);
+        assert_eq!(session.total_input_tokens, 0);
+        assert_eq!(session.total_output_tokens, 0);
     }
 
     #[test]
@@ -2089,15 +2171,7 @@ mod tests {
                 .map(|value| value.timestamp_millis()),
             Some(1775461009000)
         );
-        assert_eq!(session.events.len(), 2);
-        assert_eq!(
-            session.events[0].event_time_utc.timestamp_millis(),
-            1775461001000
-        );
-        assert_eq!(
-            session.events[1].event_time_utc.timestamp_millis(),
-            1775461009000
-        );
+        assert!(session.events.is_empty());
     }
 
     #[test]
@@ -2189,6 +2263,94 @@ mod tests {
     }
 
     #[test]
+    fn skips_empty_workspace_session_shells() {
+        let root = make_temp_root();
+        let path = write_temp_file_in_root(
+            &root,
+            "kiro/workspace-sessions/workspace-j/empty.json",
+            r#"{
+  "title": "Empty Session",
+  "sessionId": "empty-session",
+  "history": []
+}"#,
+        );
+
+        let adapter = KiroAdapter::default();
+
+        assert!(adapter
+            .discover_paths(path.parent().unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(adapter.parse(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_index_does_not_walk_storage_root_without_snapshot_dirs() {
+        let root = make_temp_root();
+        let path = write_temp_file_in_root(
+            &root,
+            "kiro/workspace-sessions/workspace-k/session-10.json",
+            r#"{
+  "title": "New Session",
+  "sessionId": "session-10",
+  "defaultModelTitle": "Agent",
+  "selectedModel": "claude-sonnet-4.5",
+  "history": [
+    {
+      "message": {
+        "role": "user",
+        "content": [{"type": "text", "text": "Check root fallback"}],
+        "id": "user-1"
+      }
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "On it.",
+        "id": "assistant-1"
+      },
+      "executionId": "exec-root-fallback"
+    }
+  ]
+}"#,
+        );
+        write_temp_file_in_root(
+            &root,
+            "kiro/exec-root-fallback-snapshot",
+            r#"{
+  "executionId": "exec-root-fallback",
+  "workflowType": "chat-agent",
+  "status": "succeed",
+  "endTime": 1775461201000,
+  "actions": [
+    {
+      "actionType": "say",
+      "output": { "message": "This root file should not be indexed without cache directories." }
+    }
+  ]
+}"#,
+        );
+
+        let adapter = KiroAdapter::default();
+        let sessions = adapter.parse(&path).unwrap();
+        let session = &sessions[0];
+
+        assert_ne!(
+            session.requests[0]
+                .source_updated_at
+                .map(|value| value.timestamp_millis()),
+            Some(1775461201000)
+        );
+        assert!(adapter
+            .fingerprint_paths(&path)
+            .iter()
+            .all(
+                |candidate| candidate.file_name().and_then(|value| value.to_str())
+                    != Some("exec-root-fallback-snapshot")
+            ));
+    }
+
+    #[test]
     fn kiro_chat_index_cache_is_bounded() {
         let mut cache = BoundedCache::new(KIRO_CHAT_INDEX_CACHE_CAPACITY);
 
@@ -2198,7 +2360,7 @@ mod tests {
                 KiroChatIndexCacheEntry {
                     index: Arc::new(KiroChatIndex::default()),
                     watch_states: Vec::new(),
-                    snapshot_states: Vec::new(),
+                    snapshot_states: HashMap::new(),
                 },
             );
         }
