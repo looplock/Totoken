@@ -2,6 +2,7 @@ use tauri::{AppHandle, Manager};
 
 use super::{ensure_storage_runtime_current, log_result, run_blocking};
 use crate::error::AppResult;
+use crate::pricing::backfill_missing_estimated_costs;
 use crate::scanner::scheduler::SchedulerPreviewView;
 use crate::settings::{self, SchedulerSettings, SettingsState};
 use crate::state::{AppState, AutoScanStatusView};
@@ -23,6 +24,13 @@ pub async fn settings_get(app: AppHandle) -> AppResult<SettingsState> {
 #[tauri::command]
 pub async fn settings_update(app: AppHandle, settings: SettingsState) -> AppResult<SettingsState> {
     ensure_storage_runtime_current(app.state::<AppState>().inner())?;
+    let previous_unknown_model_fallback_enabled = settings::get_settings(&app)
+        .map(|current| {
+            current
+                .cost_estimation
+                .bill_unknown_models_with_default_pricing
+        })
+        .unwrap_or(false);
     let app_for_save = app.clone();
     let result = run_blocking(move || settings::update_settings(&app_for_save, settings)).await;
     match log_result(
@@ -33,6 +41,22 @@ pub async fn settings_update(app: AppHandle, settings: SettingsState) -> AppResu
         BTreeMap::new(),
     ) {
         Ok(saved) => {
+            if !previous_unknown_model_fallback_enabled
+                && saved
+                    .cost_estimation
+                    .bill_unknown_models_with_default_pricing
+            {
+                let pool = app.state::<AppState>().db_pool();
+                let cost_estimation_policy = settings::cost_estimation_policy(&saved);
+                if let Err(error) = run_blocking(move || {
+                    let mut conn = pool.get()?;
+                    backfill_missing_estimated_costs(&mut conn, cost_estimation_policy)
+                })
+                .await
+                {
+                    log::warn!("failed to backfill unknown-model fallback costs after settings update: {error}");
+                }
+            }
             app.state::<crate::state::AppState>()
                 .notify_auto_scan_settings_changed();
             Ok(saved)

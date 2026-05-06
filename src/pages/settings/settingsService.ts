@@ -21,6 +21,10 @@ function normalizeSettings(settings: SettingsState): SettingsState {
       localizedTokenUnits: settings.uiPreferences.localizedTokenUnits ?? true,
       closeAction: settings.uiPreferences.closeAction === 'tray' ? 'tray' : 'quit',
     },
+    costEstimation: {
+      billUnknownModelsWithDefaultPricing:
+        settings.costEstimation?.billUnknownModelsWithDefaultPricing ?? false,
+    },
   };
 }
 

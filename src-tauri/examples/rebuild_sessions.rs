@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use app_lib::db::init_db_with_path;
+use app_lib::pricing::CostEstimationPolicy;
 use app_lib::scanner::{ScanRequest, ScanSummary, Scanner};
 use app_lib::source_settings::SourceSettingsState;
 use chrono::Utc;
@@ -55,12 +56,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             println!("scan {} {}", target.app, target.path.display());
-            let target_summary = scanner.scan(ScanRequest {
-                root_path: target.path.clone(),
-                source_app: target.app.clone(),
-                trigger_type: "manual".to_string(),
-                create_run: false,
-            })?;
+            let target_summary = scanner.scan(
+                ScanRequest {
+                    root_path: target.path.clone(),
+                    source_app: target.app.clone(),
+                    trigger_type: "manual".to_string(),
+                    create_run: false,
+                },
+                CostEstimationPolicy::default(),
+            )?;
             merge_summary(&mut summary, target_summary);
         }
         Ok(())

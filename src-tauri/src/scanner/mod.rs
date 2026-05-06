@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -8,7 +7,9 @@ use serde::Serialize;
 use crate::db::cleanup_scan_run_history;
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
-use crate::pricing::{estimate_usage_cost, ModelPricing};
+use crate::pricing::{
+    estimate_usage_cost_details, estimated_cost_source_sql, CostEstimationPolicy, ModelPricingCache,
+};
 use crate::sources::{
     claude_code::ClaudeCodeAdapter, codex::CodexAdapter, cursor::CursorAdapter,
     kilocode::KilocodeAdapter, kiro::KiroAdapter, opencode::OpencodeAdapter, NormalizedSession,
@@ -141,7 +142,11 @@ impl Scanner {
         Ok(())
     }
 
-    pub fn scan(&self, request: ScanRequest) -> AppResult<ScanSummary> {
+    pub fn scan(
+        &self,
+        request: ScanRequest,
+        cost_estimation_policy: CostEstimationPolicy,
+    ) -> AppResult<ScanSummary> {
         let started_at = Utc::now();
         let root_path = request.root_path;
         let source_app = request.source_app;
@@ -194,6 +199,7 @@ impl Scanner {
                     &path,
                     &abs_path,
                     run_id.as_deref(),
+                    cost_estimation_policy,
                     &mut files_parsed,
                     &mut files_skipped,
                     &mut files_failed,
@@ -280,6 +286,7 @@ impl Scanner {
         path: &std::path::Path,
         abs_path: &str,
         scan_run_id: Option<&str>,
+        cost_estimation_policy: CostEstimationPolicy,
         files_parsed: &mut u64,
         files_skipped: &mut u64,
         files_failed: &mut u64,
@@ -364,6 +371,7 @@ impl Scanner {
                         &cache_id,
                         scan_run_id,
                         force_rebuild_message_index,
+                        cost_estimation_policy,
                     ) {
                         Ok(changed) => {
                             if changed {
@@ -455,7 +463,11 @@ impl Scanner {
             .map(|adapter| adapter.as_ref())
     }
 
-    pub fn ensure_session_message_index(&self, session_id: &str) -> AppResult<bool> {
+    pub fn ensure_session_message_index(
+        &self,
+        session_id: &str,
+        cost_estimation_policy: CostEstimationPolicy,
+    ) -> AppResult<bool> {
         let conn = self.pool.get()?;
         let session_row = conn
             .query_row(
@@ -500,7 +512,13 @@ impl Scanner {
         };
 
         let source_file_id = source_file_id.unwrap_or_else(|| format!("manual:{source_path}"));
-        self.upsert_normalized_session(parsed_session, &source_path, &source_file_id, true)
+        self.upsert_normalized_session(
+            parsed_session,
+            &source_path,
+            &source_file_id,
+            true,
+            cost_estimation_policy,
+        )
     }
 
     fn upsert_normalized_session(
@@ -509,6 +527,7 @@ impl Scanner {
         source_path: &str,
         source_file_id: &str,
         force_rebuild_message_index: bool,
+        cost_estimation_policy: CostEstimationPolicy,
     ) -> AppResult<bool> {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction()?;
@@ -519,11 +538,13 @@ impl Scanner {
             source_file_id,
             None,
             force_rebuild_message_index,
+            cost_estimation_policy,
         )?;
         tx.commit()?;
         Ok(changed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_normalized_session_with_tx(
         &self,
         tx: &rusqlite::Transaction<'_>,
@@ -532,6 +553,7 @@ impl Scanner {
         source_file_id: &str,
         scan_run_id: Option<&str>,
         force_rebuild_message_index: bool,
+        cost_estimation_policy: CostEstimationPolicy,
     ) -> AppResult<bool> {
         let source_state = derive_source_state(&session.source_app, source_path);
         let existing_session = tx
@@ -701,7 +723,7 @@ impl Scanner {
             return Ok(metadata_changed);
         }
 
-        let mut pricing_by_model = HashMap::<String, Option<ModelPricing>>::new();
+        let mut pricing_by_model = ModelPricingCache::new();
         for request in &session.requests {
             let request_id = ids::new_uuid();
             let stored_source_request_id = request
@@ -717,9 +739,10 @@ impl Scanner {
             let request_output_tokens = request.output_tokens.unwrap_or(0);
             let request_cache_read_input_tokens = request.cache_read_input_tokens.unwrap_or(0);
             let request_cache_write_input_tokens = request.cache_write_input_tokens.unwrap_or(0);
-            let request_estimated_cost_usd = estimate_usage_cost(
+            let request_estimated_cost = estimate_usage_cost_details(
                 tx,
                 &mut pricing_by_model,
+                cost_estimation_policy,
                 request_model,
                 request_input_tokens,
                 request_output_tokens,
@@ -732,9 +755,10 @@ impl Scanner {
                     id, session_id, observation_id, source_app, source_request_id, sequence_no,
                     status, message_count, model, input_tokens, output_tokens, total_tokens,
                     cache_read_input_tokens, cache_write_input_tokens, estimated_cost_usd,
+                    estimated_cost_source,
                     token_confidence, source_created_at, source_updated_at, source_locator
                 )
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     request_id,
                     session_id,
@@ -750,7 +774,8 @@ impl Scanner {
                     request.total_tokens,
                     request.cache_read_input_tokens,
                     request.cache_write_input_tokens,
-                    request_estimated_cost_usd,
+                    request_estimated_cost.map(|cost| cost.amount_usd),
+                    request_estimated_cost.map(|cost| estimated_cost_source_sql(cost.source)),
                     request.token_confidence,
                     request.source_created_at,
                     request.source_updated_at,
@@ -762,9 +787,10 @@ impl Scanner {
         if should_rebuild_request_index {
             for event in session.events {
                 let event_id = ids::new_uuid();
-                let event_estimated_cost_usd = estimate_usage_cost(
+                let event_estimated_cost = estimate_usage_cost_details(
                     tx,
                     &mut pricing_by_model,
+                    cost_estimation_policy,
                     event.model.as_deref(),
                     event.delta_input,
                     event.delta_output,
@@ -776,9 +802,10 @@ impl Scanner {
                     "INSERT OR IGNORE INTO token_usage_events (
                         id, session_id, observation_id, event_time_utc, delta_input, delta_output, delta_total,
                         cache_read_input_tokens, cache_write_input_tokens, estimated_cost_usd,
+                        estimated_cost_source,
                         source_app, model, granularity, confidence, source_event_id
                     )
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         event_id,
                         session_id,
@@ -789,7 +816,8 @@ impl Scanner {
                         event.delta_total,
                         event.cache_read_input_tokens,
                         event.cache_write_input_tokens,
-                        event_estimated_cost_usd,
+                        event_estimated_cost.map(|cost| cost.amount_usd),
+                        event_estimated_cost.map(|cost| estimated_cost_source_sql(cost.source)),
                         session.source_app,
                         event.model,
                         event.granularity,
@@ -968,6 +996,7 @@ mod tests {
     use super::Scanner;
     use crate::db::init_db_with_path;
     use crate::error::AppResult;
+    use crate::pricing::CostEstimationPolicy;
     use crate::sources::{NormalizedRequest, NormalizedSession, SourceAdapter};
     use chrono::Utc;
     use std::path::Path;
@@ -1088,6 +1117,7 @@ mod tests {
                 &source_path,
                 &abs_path,
                 None,
+                CostEstimationPolicy::default(),
                 &mut files_parsed,
                 &mut files_skipped,
                 &mut files_failed,
@@ -1190,6 +1220,7 @@ mod tests {
                 &source_path,
                 &source_path_text,
                 None,
+                CostEstimationPolicy::default(),
                 &mut files_parsed,
                 &mut files_skipped,
                 &mut files_failed,
@@ -1242,6 +1273,7 @@ mod tests {
                 "C:/kiro/session.json",
                 "source-file-1",
                 false,
+                CostEstimationPolicy::default(),
             )
             .expect("insert first observation");
         scanner
@@ -1250,6 +1282,7 @@ mod tests {
                 "C:/kiro/session.json",
                 "source-file-1",
                 true,
+                CostEstimationPolicy::default(),
             )
             .expect("replace with reparsed observation");
 
@@ -1307,7 +1340,13 @@ mod tests {
         session.requests = vec![make_request(1, 100, 30, 140, 10)];
 
         scanner
-            .upsert_normalized_session(session, "C:/kilo/kilo.db", "source-file-1", false)
+            .upsert_normalized_session(
+                session,
+                "C:/kilo/kilo.db",
+                "source-file-1",
+                false,
+                CostEstimationPolicy::default(),
+            )
             .expect("insert cache-aware observation");
 
         let conn = pool.get().expect("load db conn");
@@ -1368,6 +1407,7 @@ mod tests {
                 "C:/Users/test/.claude/projects/demo/session.jsonl",
                 "source-file-1",
                 false,
+                CostEstimationPolicy::default(),
             )
             .expect("insert original session");
 
@@ -1382,6 +1422,7 @@ mod tests {
                 "C:/Users/test/.claude/projects/demo/session.jsonl",
                 "source-file-1",
                 true,
+                CostEstimationPolicy::default(),
             )
             .expect("reparse session with missing models");
 
@@ -1448,7 +1489,13 @@ mod tests {
         };
 
         scanner
-            .upsert_normalized_session(session, "C:/Cursor/state.vscdb", "source-file-1", false)
+            .upsert_normalized_session(
+                session,
+                "C:/Cursor/state.vscdb",
+                "source-file-1",
+                false,
+                CostEstimationPolicy::default(),
+            )
             .expect("insert estimated cursor session");
 
         let conn = pool.get().expect("load db conn");
@@ -1524,6 +1571,7 @@ mod tests {
                 "C:/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/demo/session.json",
                 "source-file-1",
                 false,
+                CostEstimationPolicy::default(),
             )
             .expect("insert estimated kiro session");
 
@@ -1609,6 +1657,7 @@ mod tests {
                 "C:/Cursor/User/globalStorage/state.vscdb",
                 "global-source-file",
                 false,
+                CostEstimationPolicy::default(),
             )
             .expect("insert global cursor session");
 
@@ -1628,6 +1677,7 @@ mod tests {
                 "C:/Cursor/User/workspaceStorage/hash/state.vscdb",
                 "workspace-source-file",
                 false,
+                CostEstimationPolicy::default(),
             )
             .expect("insert workspace cursor metadata");
 
@@ -1701,12 +1751,19 @@ mod tests {
                 "C:/kiro/session.json",
                 "source-file-1",
                 false,
+                CostEstimationPolicy::default(),
             )
             .expect("insert first observation");
         assert!(first_changed);
 
         let second_changed = scanner
-            .upsert_normalized_session(session, "C:/kiro/session.json", "source-file-1", false)
+            .upsert_normalized_session(
+                session,
+                "C:/kiro/session.json",
+                "source-file-1",
+                false,
+                CostEstimationPolicy::default(),
+            )
             .expect("reparse identical observation");
         assert!(!second_changed);
 

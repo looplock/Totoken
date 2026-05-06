@@ -1,4 +1,5 @@
 use super::*;
+use crate::pricing::estimate_usage_cost;
 
 impl Repository {
     pub fn statistics_get(&self, query: Option<StatisticsQuery>) -> AppResult<StatisticsOverview> {
@@ -10,12 +11,14 @@ impl Repository {
             query.start_at,
             query.end_at,
             query.source_app.as_deref(),
+            self.cost_estimation_policy,
         )?;
         let previous_events = load_statistics_records(
             &conn,
             query.previous_start_at,
             query.start_at,
             query.source_app.as_deref(),
+            self.cost_estimation_policy,
         )?;
 
         let available_models = build_available_models(&current_events);
@@ -189,10 +192,16 @@ fn load_statistics_records(
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
     source_app: Option<&str>,
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<Vec<StatisticsEventRecord>> {
-    let mut events = load_statistics_events(conn, start_at, end_at, source_app)?;
+    let mut events =
+        load_statistics_events(conn, start_at, end_at, source_app, cost_estimation_policy)?;
     events.extend(load_statistics_legacy_totals(
-        conn, start_at, end_at, source_app,
+        conn,
+        start_at,
+        end_at,
+        source_app,
+        cost_estimation_policy,
     )?);
     events.sort_by(|left, right| {
         left.event_time_utc
@@ -208,6 +217,7 @@ fn load_statistics_events(
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
     source_app: Option<&str>,
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<Vec<StatisticsEventRecord>> {
     let sql = if source_app.is_some() {
         format!(
@@ -264,7 +274,7 @@ fn load_statistics_events(
     for row in rows {
         events.push(row?);
     }
-    hydrate_statistics_event_estimated_costs(conn, &mut events)?;
+    hydrate_statistics_event_estimated_costs(conn, &mut events, cost_estimation_policy)?;
     Ok(events)
 }
 
@@ -273,6 +283,7 @@ fn load_statistics_legacy_totals(
     start_at: DateTime<Utc>,
     end_at: DateTime<Utc>,
     source_app: Option<&str>,
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<Vec<StatisticsEventRecord>> {
     let sql = if source_app.is_some() {
         format!(
@@ -343,7 +354,7 @@ fn load_statistics_legacy_totals(
     for row in rows {
         events.push(row?);
     }
-    hydrate_statistics_event_estimated_costs(conn, &mut events)?;
+    hydrate_statistics_event_estimated_costs(conn, &mut events, cost_estimation_policy)?;
     Ok(events)
 }
 
@@ -724,13 +735,15 @@ fn compute_delta_percent_f64(current: f64, previous: f64) -> f64 {
 fn hydrate_statistics_event_estimated_costs(
     conn: &rusqlite::Connection,
     events: &mut [StatisticsEventRecord],
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<()> {
-    let mut pricing_by_model = HashMap::<String, Option<ModelPricing>>::new();
+    let mut pricing_by_model = crate::pricing::ModelPricingCache::new();
 
     for event in events {
         event.estimated_cost_usd = estimate_usage_cost(
             conn,
             &mut pricing_by_model,
+            cost_estimation_policy,
             Some(event.model.as_str()),
             event.delta_input,
             event.delta_output,

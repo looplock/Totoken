@@ -51,6 +51,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0002_session_list_indexes",
         sql: include_str!("migrations/0002_session_list_indexes.sql"),
     },
+    Migration {
+        version: "0003_estimated_cost_source",
+        sql: include_str!("migrations/0003_estimated_cost_source.sql"),
+    },
 ];
 
 fn run_migrations(conn: &mut rusqlite::Connection) -> AppResult<()> {

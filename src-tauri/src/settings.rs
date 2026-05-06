@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 use crate::error::{AppError, AppResult};
+use crate::pricing::CostEstimationPolicy;
 use crate::scanner::scheduler::{self, SchedulerPreviewView, AUTO_SCAN_SOURCE_APP};
 use crate::source_settings;
 use crate::state::{AppState, AutoScanStatusView};
@@ -45,11 +46,20 @@ pub struct UiPreferencesSettings {
     pub close_action: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostEstimationSettings {
+    #[serde(default = "default_false")]
+    pub bill_unknown_models_with_default_pricing: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsState {
     pub scheduler: SchedulerSettings,
     pub ui_preferences: UiPreferencesSettings,
+    #[serde(default)]
+    pub cost_estimation: CostEstimationSettings,
 }
 
 pub fn get_settings(app: &AppHandle) -> AppResult<SettingsState> {
@@ -105,6 +115,18 @@ pub fn reset_settings(app: &AppHandle) -> AppResult<SettingsState> {
     write_settings_file(&settings_path, &defaults)?;
     sync_tray_visibility_for_close_action(app, &defaults.ui_preferences.close_action);
     Ok(defaults)
+}
+
+pub fn cost_estimation_policy(settings: &SettingsState) -> CostEstimationPolicy {
+    CostEstimationPolicy {
+        bill_unknown_models_with_default_pricing: settings
+            .cost_estimation
+            .bill_unknown_models_with_default_pricing,
+    }
+}
+
+pub fn get_cost_estimation_policy(app: &AppHandle) -> AppResult<CostEstimationPolicy> {
+    get_settings(app).map(|settings| cost_estimation_policy(&settings))
 }
 
 pub fn get_auto_scan_status(app: &AppHandle, state: &AppState) -> AppResult<AutoScanStatusView> {
@@ -252,6 +274,7 @@ pub fn default_settings() -> SettingsState {
             localized_token_units: true,
             close_action: CLOSE_ACTION_QUIT.to_string(),
         },
+        cost_estimation: CostEstimationSettings::default(),
     }
 }
 
@@ -261,6 +284,10 @@ fn default_scan_mode() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_close_action() -> String {

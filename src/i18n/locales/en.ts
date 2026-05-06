@@ -173,7 +173,7 @@ export const enMessages = {
   'settings.info.scheduler':
     'Configure how background scans run, including scan mode, interval bounds, and adaptive scheduling.',
   'settings.info.preferences':
-    'Adjust the interface theme, language, notifications, and token unit display.',
+    'Adjust the interface theme, language, notifications, token unit display, and fallback cost estimation behavior.',
   'settings.info.storage':
     'Choose where Totoken stores its database, cache, and configuration files. Restart the app after changing this path.',
   'settings.info.ewma':
@@ -229,6 +229,9 @@ export const enMessages = {
   'settings.preferences.tokenUnits': 'Localized token units',
   'settings.preferences.tokenUnitsHint':
     'Use language-specific compact units for token counts. Turn off to always use English units such as K, M, and B.',
+  'settings.preferences.unknownModelPricing': 'Fallback pricing for unknown models',
+  'settings.preferences.unknownModelPricingHint':
+    'When enabled, models without a matched catalog price use the built-in fallback rate of $0.5 input and $2 output per million tokens.',
   'settings.feedback.loading': 'Loading settings...',
   'settings.feedback.loadFailed': 'Failed to load settings.',
   'settings.feedback.saveFailed': 'Failed to save settings.',

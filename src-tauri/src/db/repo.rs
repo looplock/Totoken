@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
@@ -11,7 +11,7 @@ use crate::models::{
     StatisticsMetricValue, StatisticsOverview, StatisticsQuery, StatisticsRange, StatisticsSummary,
     StatisticsTrend,
 };
-use crate::pricing::{estimate_usage_cost, ModelPricing};
+use crate::pricing::CostEstimationPolicy;
 use chrono::{
     DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Timelike, Utc,
 };
@@ -48,6 +48,7 @@ const ALLOWED_SORT_FIELDS: &[&str] = &[
 ];
 pub struct Repository {
     pool: DbPool,
+    cost_estimation_policy: CostEstimationPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -119,16 +120,29 @@ struct TimeBucket {
     end_at: DateTime<Utc>,
 }
 
+impl Repository {
+    pub fn new(pool: DbPool) -> Self {
+        Self {
+            pool,
+            cost_estimation_policy: CostEstimationPolicy::default(),
+        }
+    }
+
+    pub fn with_cost_estimation_policy(
+        pool: DbPool,
+        cost_estimation_policy: CostEstimationPolicy,
+    ) -> Self {
+        Self {
+            pool,
+            cost_estimation_policy,
+        }
+    }
+}
+
 mod messages;
 mod scan_records;
 mod sessions;
 mod statistics;
-
-impl Repository {
-    pub fn new(pool: DbPool) -> Self {
-        Self { pool }
-    }
-}
 
 fn normalize_string_filters(
     values: Option<Vec<String>>,

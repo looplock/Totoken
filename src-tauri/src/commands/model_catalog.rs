@@ -6,6 +6,7 @@ use crate::model_catalog::{
     refresh_model_catalog as run_model_catalog_refresh, ModelCatalogListQuery,
     ModelCatalogListResponse, ModelCatalogSyncRunView, ModelCatalogSyncStatusView,
 };
+use crate::settings;
 use crate::state::AppState;
 use std::collections::BTreeMap;
 
@@ -24,10 +25,12 @@ pub async fn list_models(
 
 #[tauri::command]
 pub async fn refresh_model_catalog(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<ModelCatalogSyncRunView> {
     ensure_storage_runtime_current(&state)?;
-    match run_model_catalog_refresh(state.db_pool()).await {
+    let cost_estimation_policy = settings::get_cost_estimation_policy(&app)?;
+    match run_model_catalog_refresh(state.db_pool(), cost_estimation_policy).await {
         Ok(result) => Ok(result),
         Err(error) => {
             log_command_error(&state, "model_catalog", "refresh", &error, BTreeMap::new());
