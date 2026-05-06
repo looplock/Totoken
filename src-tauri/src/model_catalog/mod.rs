@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::db::DbPool;
 use crate::error::{AppError, AppResult};
-use crate::pricing::backfill_missing_estimated_costs;
+use crate::pricing::{backfill_missing_estimated_costs, CostEstimationPolicy};
 use crate::utils::{ids::new_uuid, time::now_utc};
 
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models?output_modalities=all";
@@ -306,7 +306,10 @@ pub fn get_model_sync_status(pool: DbPool) -> AppResult<ModelCatalogSyncStatusVi
     })
 }
 
-pub async fn refresh_model_catalog(pool: DbPool) -> AppResult<ModelCatalogSyncRunView> {
+pub async fn refresh_model_catalog(
+    pool: DbPool,
+    cost_estimation_policy: CostEstimationPolicy,
+) -> AppResult<ModelCatalogSyncRunView> {
     let run_id = new_uuid();
     let started_at = now_utc();
 
@@ -337,7 +340,7 @@ pub async fn refresh_model_catalog(pool: DbPool) -> AppResult<ModelCatalogSyncRu
 
     {
         let mut conn = pool.get()?;
-        let backfill_summary = backfill_missing_estimated_costs(&mut conn)?;
+        let backfill_summary = backfill_missing_estimated_costs(&mut conn, cost_estimation_policy)?;
         log::info!(
             "Model catalog refresh backfilled estimated costs: session_requests_updated={}, token_usage_events_updated={}",
             backfill_summary.session_requests_updated,

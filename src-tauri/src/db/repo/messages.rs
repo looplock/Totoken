@@ -1,4 +1,5 @@
 use super::*;
+use crate::pricing::estimate_usage_cost;
 
 impl Repository {
     pub fn messages_list(&self, query: Option<MessageListQuery>) -> AppResult<MessageListResponse> {
@@ -120,7 +121,7 @@ impl Repository {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        hydrate_request_estimated_costs(&conn, &mut request_rows)?;
+        hydrate_request_estimated_costs(&conn, &mut request_rows, self.cost_estimation_policy)?;
 
         let mut event_stmt = conn.prepare(
             "SELECT
@@ -165,7 +166,7 @@ impl Repository {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        hydrate_usage_event_estimated_costs(&conn, &mut usage_events)?;
+        hydrate_usage_event_estimated_costs(&conn, &mut usage_events, self.cost_estimation_policy)?;
         session.session_estimated_cost_usd = sum_estimated_costs(
             request_rows
                 .iter()
@@ -217,13 +218,15 @@ fn build_request_locator_label(source_app: &str, sequence_no: i64, source_locato
 fn hydrate_request_estimated_costs(
     conn: &rusqlite::Connection,
     requests: &mut [MessageRequestItem],
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<()> {
-    let mut pricing_by_model = HashMap::<String, Option<ModelPricing>>::new();
+    let mut pricing_by_model = crate::pricing::ModelPricingCache::new();
 
     for request in requests {
         request.estimated_cost_usd = estimate_usage_cost(
             conn,
             &mut pricing_by_model,
+            cost_estimation_policy,
             request.model.as_deref(),
             request.input_tokens.unwrap_or(0),
             request.output_tokens.unwrap_or(0),
@@ -239,13 +242,15 @@ fn hydrate_request_estimated_costs(
 fn hydrate_usage_event_estimated_costs(
     conn: &rusqlite::Connection,
     events: &mut [MessageUsageEventItem],
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<()> {
-    let mut pricing_by_model = HashMap::<String, Option<ModelPricing>>::new();
+    let mut pricing_by_model = crate::pricing::ModelPricingCache::new();
 
     for event in events {
         event.estimated_cost_usd = estimate_usage_cost(
             conn,
             &mut pricing_by_model,
+            cost_estimation_policy,
             event.model.as_deref(),
             event.delta_input,
             event.delta_output,

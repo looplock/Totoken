@@ -7,6 +7,8 @@ const SESSION_SOURCE_STATE_SQL: &str =
     "CASE s.source_state WHEN 'active' THEN 'synced' WHEN 'deleted_by_user' THEN 'deleted' ELSE s.source_state END";
 const SESSION_ESTIMATED_COST_SQL: &str =
     "(SELECT SUM(r.estimated_cost_usd) FROM session_requests r WHERE r.session_id = s.id)";
+const SESSION_ESTIMATED_COST_WITHOUT_FALLBACK_SQL: &str =
+    "(SELECT SUM(r.estimated_cost_usd) FROM session_requests r WHERE r.session_id = s.id AND COALESCE(r.estimated_cost_source, 'catalog') != 'fallback')";
 const SESSION_LIST_INPUT_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.input_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.input_tokens, 0)), 0) FROM session_requests r WHERE r.session_id = s.id) END";
 const SESSION_LIST_OUTPUT_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.output_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.output_tokens, 0)), 0) FROM session_requests r WHERE r.session_id = s.id) END";
 const SESSION_LIST_TOTAL_TOKENS_SQL: &str = "CASE WHEN COALESCE(st.total_tokens_max, 0) > 0 THEN COALESCE(st.total_tokens_max, 0) ELSE (SELECT COALESCE(SUM(COALESCE(r.total_tokens, COALESCE(r.input_tokens, 0) + COALESCE(r.output_tokens, 0) + COALESCE(r.cache_read_input_tokens, 0) + COALESCE(r.cache_write_input_tokens, 0))), 0) FROM session_requests r WHERE r.session_id = s.id) END";
@@ -59,7 +61,13 @@ impl Repository {
         };
         let page = query.page.min(total_pages.max(1));
         let offset = (page - 1) * query.page_size;
-        let items = load_session_page(&conn, &query, query.page_size, offset)?;
+        let items = load_session_page(
+            &conn,
+            &query,
+            self.cost_estimation_policy,
+            query.page_size,
+            offset,
+        )?;
 
         Ok(SessionListResponse {
             items,
@@ -82,11 +90,13 @@ impl Repository {
 fn load_session_page(
     conn: &rusqlite::Connection,
     query: &NormalizedSessionListQuery,
+    cost_estimation_policy: CostEstimationPolicy,
     limit: u64,
     offset: u64,
 ) -> AppResult<Vec<SessionListItem>> {
     let (where_sql, mut sql_params) = build_session_where_clause(query, true);
-    let order_sql = session_order_clause(query);
+    let session_estimated_cost_sql = session_estimated_cost_sql(cost_estimation_policy);
+    let order_sql = session_order_clause(query, session_estimated_cost_sql);
     let sql = format!(
         "SELECT
             s.id,
@@ -99,7 +109,7 @@ fn load_session_page(
             {SESSION_LIST_OUTPUT_TOKENS_SQL},
             {SESSION_LIST_TOTAL_TOKENS_SQL},
             NULL,
-            {SESSION_ESTIMATED_COST_SQL},
+            {session_estimated_cost_sql},
             COALESCE(obs.message_count, 0)
          FROM sessions s
          LEFT JOIN session_token_totals st ON st.session_id = s.id
@@ -240,7 +250,10 @@ fn sql_placeholders(count: usize) -> String {
     (0..count).map(|_| "?").collect::<Vec<_>>().join(", ")
 }
 
-fn session_order_clause(query: &NormalizedSessionListQuery) -> String {
+fn session_order_clause(
+    query: &NormalizedSessionListQuery,
+    session_estimated_cost_sql: &str,
+) -> String {
     let direction = if query.sort_order == "asc" {
         "ASC"
     } else {
@@ -262,14 +275,22 @@ fn session_order_clause(query: &NormalizedSessionListQuery) -> String {
         }
         "estimatedCostUsd" if query.sort_order == "desc" => {
             format!(
-                "({SESSION_ESTIMATED_COST_SQL}) IS NOT NULL ASC, {SESSION_ESTIMATED_COST_SQL} DESC, s.id DESC"
+                "({session_estimated_cost_sql}) IS NOT NULL ASC, {session_estimated_cost_sql} DESC, s.id DESC"
             )
         }
-        "estimatedCostUsd" => format!("{SESSION_ESTIMATED_COST_SQL} ASC, s.id ASC"),
+        "estimatedCostUsd" => format!("{session_estimated_cost_sql} ASC, s.id ASC"),
         "messages" => format!("COALESCE(obs.message_count, 0) {direction}, s.id {direction}"),
         "sourceState" => format!("{SESSION_SOURCE_STATE_SQL} {direction}, s.id {direction}"),
         "lastUpdated" => format!("{SESSION_LAST_UPDATED_SQL} {direction}, s.id {direction}"),
         _ => format!("{SESSION_LAST_UPDATED_SQL} DESC, s.id DESC"),
+    }
+}
+
+fn session_estimated_cost_sql(cost_estimation_policy: CostEstimationPolicy) -> &'static str {
+    if cost_estimation_policy.bill_unknown_models_with_default_pricing {
+        SESSION_ESTIMATED_COST_SQL
+    } else {
+        SESSION_ESTIMATED_COST_WITHOUT_FALLBACK_SQL
     }
 }
 

@@ -336,6 +336,7 @@ fn run_auto_scan_loop(app: AppHandle, state: AppState, receiver: Receiver<AutoSc
 }
 
 fn run_auto_scan_once(app: &AppHandle, state: &AppState) -> AppResult<AutoScanRunOutcome> {
+    let cost_estimation_policy = settings::get_cost_estimation_policy(app)?;
     let sources =
         source_settings::list_enabled_scannable_sources(app, &state.source_settings_store())?;
     if sources.is_empty() {
@@ -376,12 +377,15 @@ fn run_auto_scan_once(app: &AppHandle, state: &AppState) -> AppResult<AutoScanRu
                 continue;
             }
 
-            let source_summary = scanner.scan(ScanRequest {
-                root_path: source.path,
-                source_app: source.app,
-                trigger_type: AUTO_SCAN_TRIGGER.to_string(),
-                create_run: false,
-            })?;
+            let source_summary = scanner.scan(
+                ScanRequest {
+                    root_path: source.path,
+                    source_app: source.app,
+                    trigger_type: AUTO_SCAN_TRIGGER.to_string(),
+                    create_run: false,
+                },
+                cost_estimation_policy,
+            )?;
             summary.files_seen += source_summary.files_seen;
             summary.files_parsed += source_summary.files_parsed;
             summary.files_skipped += source_summary.files_skipped;

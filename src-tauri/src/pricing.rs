@@ -4,12 +4,40 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppResult;
 
+const DEFAULT_UNKNOWN_MODEL_INPUT_USD_PER_MTOK: f64 = 0.5;
+const DEFAULT_UNKNOWN_MODEL_OUTPUT_USD_PER_MTOK: f64 = 2.0;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelPricing {
     pub input_usd_per_mtok: Option<f64>,
     pub output_usd_per_mtok: Option<f64>,
     pub cache_read_usd_per_mtok: Option<f64>,
     pub cache_write_usd_per_mtok: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimatedCostSource {
+    Catalog,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedModelPricing {
+    pub pricing: ModelPricing,
+    pub source: EstimatedCostSource,
+}
+
+pub type ModelPricingCache = HashMap<String, Option<ResolvedModelPricing>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CostEstimationPolicy {
+    pub bill_unknown_models_with_default_pricing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EstimatedUsageCost {
+    pub amount_usd: f64,
+    pub source: EstimatedCostSource,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,7 +60,8 @@ struct CostBackfillUsageRow {
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_usage_cost(
     conn: &Connection,
-    pricing_by_model: &mut HashMap<String, Option<ModelPricing>>,
+    pricing_by_model: &mut ModelPricingCache,
+    policy: CostEstimationPolicy,
     model_name: Option<&str>,
     input_tokens: i64,
     output_tokens: i64,
@@ -40,14 +69,41 @@ pub fn estimate_usage_cost(
     cache_read_input_tokens: i64,
     cache_write_input_tokens: i64,
 ) -> AppResult<Option<f64>> {
+    Ok(estimate_usage_cost_details(
+        conn,
+        pricing_by_model,
+        policy,
+        model_name,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+    )?
+    .map(|cost| cost.amount_usd))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_usage_cost_details(
+    conn: &Connection,
+    pricing_by_model: &mut ModelPricingCache,
+    policy: CostEstimationPolicy,
+    model_name: Option<&str>,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: Option<i64>,
+    cache_read_input_tokens: i64,
+    cache_write_input_tokens: i64,
+) -> AppResult<Option<EstimatedUsageCost>> {
     let Some(model_name) = sanitize_model_name(model_name) else {
         return Ok(None);
     };
 
-    let pricing = resolve_model_pricing(conn, pricing_by_model, &model_name)?;
-    let Some(pricing) = pricing else {
+    let resolved = resolve_model_pricing(conn, pricing_by_model, policy, &model_name)?;
+    let Some(resolved) = resolved else {
         return Ok(None);
     };
+    let pricing = resolved.pricing;
     if pricing.input_usd_per_mtok.is_none()
         && pricing.output_usd_per_mtok.is_none()
         && pricing.cache_read_usd_per_mtok.is_none()
@@ -73,22 +129,27 @@ pub fn estimate_usage_cost(
         + cost_component(cache_read_input_tokens, pricing.cache_read_usd_per_mtok)
         + cost_component(cache_write_input_tokens, pricing.cache_write_usd_per_mtok);
 
-    Ok((total_cost > 0.0).then_some(total_cost))
+    Ok((total_cost > 0.0).then_some(EstimatedUsageCost {
+        amount_usd: total_cost,
+        source: resolved.source,
+    }))
 }
 
 pub fn backfill_missing_estimated_costs(
     conn: &mut Connection,
+    policy: CostEstimationPolicy,
 ) -> AppResult<EstimatedCostBackfillSummary> {
     let tx = conn.transaction()?;
     let request_rows = load_session_request_cost_backfill_rows(&tx)?;
     let event_rows = load_token_usage_event_cost_backfill_rows(&tx)?;
-    let mut pricing_by_model = HashMap::<String, Option<ModelPricing>>::new();
+    let mut pricing_by_model = ModelPricingCache::new();
     let mut summary = EstimatedCostBackfillSummary::default();
 
     for row in request_rows {
-        let Some(estimated_cost_usd) = estimate_usage_cost(
+        let Some(estimated_cost) = estimate_usage_cost_details(
             &tx,
             &mut pricing_by_model,
+            policy,
             Some(row.model.as_str()),
             row.input_tokens,
             row.output_tokens,
@@ -102,18 +163,24 @@ pub fn backfill_missing_estimated_costs(
 
         let updated = tx.execute(
             "UPDATE session_requests
-             SET estimated_cost_usd = ?2
+             SET estimated_cost_usd = ?2,
+                 estimated_cost_source = ?3
              WHERE id = ?1
                AND estimated_cost_usd IS NULL",
-            params![row.id, estimated_cost_usd],
+            params![
+                row.id,
+                estimated_cost.amount_usd,
+                estimated_cost_source_sql(estimated_cost.source)
+            ],
         )?;
         summary.session_requests_updated += updated;
     }
 
     for row in event_rows {
-        let Some(estimated_cost_usd) = estimate_usage_cost(
+        let Some(estimated_cost) = estimate_usage_cost_details(
             &tx,
             &mut pricing_by_model,
+            policy,
             Some(row.model.as_str()),
             row.input_tokens,
             row.output_tokens,
@@ -127,10 +194,15 @@ pub fn backfill_missing_estimated_costs(
 
         let updated = tx.execute(
             "UPDATE token_usage_events
-             SET estimated_cost_usd = ?2
+             SET estimated_cost_usd = ?2,
+                 estimated_cost_source = ?3
              WHERE id = ?1
                AND estimated_cost_usd IS NULL",
-            params![row.id, estimated_cost_usd],
+            params![
+                row.id,
+                estimated_cost.amount_usd,
+                estimated_cost_source_sql(estimated_cost.source)
+            ],
         )?;
         summary.token_usage_events_updated += updated;
     }
@@ -141,14 +213,23 @@ pub fn backfill_missing_estimated_costs(
 
 pub fn resolve_model_pricing(
     conn: &Connection,
-    pricing_by_model: &mut HashMap<String, Option<ModelPricing>>,
+    pricing_by_model: &mut ModelPricingCache,
+    policy: CostEstimationPolicy,
     model_name: &str,
-) -> AppResult<Option<ModelPricing>> {
+) -> AppResult<Option<ResolvedModelPricing>> {
     let Some(model_name) = sanitize_model_name(Some(model_name)) else {
         return Ok(None);
     };
 
-    let cache_key = model_name.to_ascii_lowercase();
+    let cache_key = format!(
+        "{}:{}",
+        model_name.to_ascii_lowercase(),
+        if policy.bill_unknown_models_with_default_pricing {
+            "fallback-on"
+        } else {
+            "fallback-off"
+        }
+    );
     if let Some(cached) = pricing_by_model.get(&cache_key) {
         return Ok(*cached);
     }
@@ -170,8 +251,22 @@ pub fn resolve_model_pricing(
         }
     }
 
-    pricing_by_model.insert(cache_key, pricing);
-    Ok(pricing)
+    let resolved = match pricing {
+        Some(pricing) if has_billable_pricing(pricing) => Some(ResolvedModelPricing {
+            pricing,
+            source: EstimatedCostSource::Catalog,
+        }),
+        Some(_) | None if policy.bill_unknown_models_with_default_pricing => {
+            Some(ResolvedModelPricing {
+                pricing: default_unknown_model_pricing(),
+                source: EstimatedCostSource::Fallback,
+            })
+        }
+        _ => None,
+    };
+
+    pricing_by_model.insert(cache_key, resolved);
+    Ok(resolved)
 }
 
 fn load_session_request_cost_backfill_rows(
@@ -342,6 +437,29 @@ fn map_model_pricing_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelPrici
 
 fn sanitize_price_component(value: Option<f64>) -> Option<f64> {
     value.filter(|price| price.is_finite() && *price > 0.0)
+}
+
+fn default_unknown_model_pricing() -> ModelPricing {
+    ModelPricing {
+        input_usd_per_mtok: Some(DEFAULT_UNKNOWN_MODEL_INPUT_USD_PER_MTOK),
+        output_usd_per_mtok: Some(DEFAULT_UNKNOWN_MODEL_OUTPUT_USD_PER_MTOK),
+        cache_read_usd_per_mtok: None,
+        cache_write_usd_per_mtok: None,
+    }
+}
+
+fn has_billable_pricing(pricing: ModelPricing) -> bool {
+    pricing.input_usd_per_mtok.is_some()
+        || pricing.output_usd_per_mtok.is_some()
+        || pricing.cache_read_usd_per_mtok.is_some()
+        || pricing.cache_write_usd_per_mtok.is_some()
+}
+
+pub fn estimated_cost_source_sql(source: EstimatedCostSource) -> &'static str {
+    match source {
+        EstimatedCostSource::Catalog => "catalog",
+        EstimatedCostSource::Fallback => "fallback",
+    }
 }
 
 fn sanitize_model_name(model_name: Option<&str>) -> Option<String> {
@@ -539,6 +657,7 @@ fn cost_component(tokens: i64, price_usd_per_mtok: Option<f64>) -> f64 {
 mod tests {
     use super::{
         backfill_missing_estimated_costs, build_model_lookup_candidates, estimate_usage_cost,
+        CostEstimationPolicy,
     };
     use crate::db::init_db_with_path;
     use chrono::Utc;
@@ -566,8 +685,18 @@ mod tests {
         let conn = pool.get().expect("get conn");
         let mut cache = HashMap::new();
 
-        let cost = estimate_usage_cost(&conn, &mut cache, Some("auto"), 35, 323, Some(358), 0, 0)
-            .expect("estimate cost");
+        let cost = estimate_usage_cost(
+            &conn,
+            &mut cache,
+            CostEstimationPolicy::default(),
+            Some("auto"),
+            35,
+            323,
+            Some(358),
+            0,
+            0,
+        )
+        .expect("estimate cost");
         assert_eq!(cost, None);
 
         let _ = std::fs::remove_file(&db_path);
@@ -643,6 +772,7 @@ mod tests {
         assert!(estimate_usage_cost(
             &conn,
             &mut cache,
+            CostEstimationPolicy::default(),
             Some("gpt-5.4"),
             1_000_000,
             500_000,
@@ -655,6 +785,7 @@ mod tests {
         assert!(estimate_usage_cost(
             &conn,
             &mut cache,
+            CostEstimationPolicy::default(),
             Some("gpt-5.3-codex"),
             1_000_000,
             500_000,
@@ -667,6 +798,7 @@ mod tests {
         assert!(estimate_usage_cost(
             &conn,
             &mut cache,
+            CostEstimationPolicy::default(),
             Some("claude-sonnet-4.5"),
             1_000_000,
             500_000,
@@ -679,6 +811,7 @@ mod tests {
         assert!(estimate_usage_cost(
             &conn,
             &mut cache,
+            CostEstimationPolicy::default(),
             Some("claude-opus-4-7"),
             1_000_000,
             500_000,
@@ -691,6 +824,7 @@ mod tests {
         assert!(estimate_usage_cost(
             &conn,
             &mut cache,
+            CostEstimationPolicy::default(),
             Some("MiniMax-M2.7"),
             1_000_000,
             500_000,
@@ -703,6 +837,7 @@ mod tests {
         assert!(estimate_usage_cost(
             &conn,
             &mut cache,
+            CostEstimationPolicy::default(),
             Some("glm-5.1"),
             1_000_000,
             500_000,
@@ -787,7 +922,8 @@ mod tests {
         )
         .expect("insert event");
 
-        let summary = backfill_missing_estimated_costs(&mut conn).expect("backfill costs");
+        let summary = backfill_missing_estimated_costs(&mut conn, CostEstimationPolicy::default())
+            .expect("backfill costs");
         assert_eq!(summary.session_requests_updated, 1);
         assert_eq!(summary.token_usage_events_updated, 1);
 
@@ -811,6 +947,51 @@ mod tests {
 
         drop(conn);
         drop(pool);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn estimate_usage_cost_can_use_default_pricing_for_unknown_models() {
+        let db_path = std::env::temp_dir().join(format!(
+            "totoken-pricing-unknown-model-test-{}.db",
+            crate::utils::ids::new_uuid()
+        ));
+        let pool = init_db_with_path(&db_path).expect("init db");
+        let conn = pool.get().expect("get conn");
+        let mut cache = HashMap::new();
+
+        let disabled_cost = estimate_usage_cost(
+            &conn,
+            &mut cache,
+            CostEstimationPolicy::default(),
+            Some("mystery-model"),
+            1_000_000,
+            500_000,
+            Some(1_500_000),
+            0,
+            0,
+        )
+        .expect("estimate unknown model cost with fallback disabled");
+        assert_eq!(disabled_cost, None);
+
+        let enabled_cost = estimate_usage_cost(
+            &conn,
+            &mut cache,
+            CostEstimationPolicy {
+                bill_unknown_models_with_default_pricing: true,
+            },
+            Some("mystery-model"),
+            1_000_000,
+            500_000,
+            Some(1_500_000),
+            0,
+            0,
+        )
+        .expect("estimate unknown model cost with fallback enabled");
+        assert_eq!(enabled_cost, Some(1.5));
+
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_path.with_extension("db-shm"));

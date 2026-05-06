@@ -83,7 +83,9 @@ function settingsEqual(left: SettingsState, right: SettingsState) {
     left.uiPreferences.language === right.uiPreferences.language &&
     left.uiPreferences.notifications === right.uiPreferences.notifications &&
     left.uiPreferences.localizedTokenUnits === right.uiPreferences.localizedTokenUnits &&
-    left.uiPreferences.closeAction === right.uiPreferences.closeAction
+    left.uiPreferences.closeAction === right.uiPreferences.closeAction &&
+    left.costEstimation.billUnknownModelsWithDefaultPricing ===
+      right.costEstimation.billUnknownModelsWithDefaultPricing
   );
 }
 
@@ -190,7 +192,8 @@ export function SettingsPage() {
         t('settings.preferences.closeActionQuit'),
         t('settings.preferences.closeActionTray'),
         t('settings.preferences.tokenUnits'),
-        'ui alerts language theme close quit tray token units blue green amber light dark',
+        t('settings.preferences.unknownModelPricing'),
+        'ui alerts language theme close quit tray token units unknown model pricing cost billing fallback default blue green amber light dark',
       )
     ) {
       result.add('preferences');
@@ -952,6 +955,32 @@ export function SettingsPage() {
                           }))
                         }
                         label={t('settings.preferences.tokenUnits')}
+                      />
+                    </div>
+
+                    <div className="settings-preference-toggle settings-preference-item settings-control-card settings-control-card-toggle">
+                      <div className="settings-toggle-content">
+                        <p className="settings-toggle-title">
+                          {t('settings.preferences.unknownModelPricing')}
+                        </p>
+                        <p className="settings-toggle-hint">
+                          {t('settings.preferences.unknownModelPricingHint')}
+                        </p>
+                      </div>
+                      <Switch
+                        size="sm"
+                        checked={settings.costEstimation.billUnknownModelsWithDefaultPricing}
+                        onToggle={() =>
+                          updateSettings((current) => ({
+                            ...current,
+                            costEstimation: {
+                              ...current.costEstimation,
+                              billUnknownModelsWithDefaultPricing:
+                                !current.costEstimation.billUnknownModelsWithDefaultPricing,
+                            },
+                          }))
+                        }
+                        label={t('settings.preferences.unknownModelPricing')}
                       />
                     </div>
                   </div>

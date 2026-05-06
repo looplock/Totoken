@@ -166,7 +166,8 @@ export const zhMessages = {
   'settings.info.label': '设置说明',
   'settings.info.scheduler':
     '配置后台扫描的执行方式、间隔范围和自适应调度参数。手动模式下不会自动扫描。',
-  'settings.info.preferences': '调整界面主题、语言、通知和 Token 单位显示方式。',
+  'settings.info.preferences':
+    '调整界面主题、语言、通知、Token 单位显示方式，以及未知模型的默认成本估算策略。',
   'settings.info.storage':
     '选择 Totoken 存放数据库、缓存和配置文件的数据目录。切换后需要重启应用完全生效。',
   'settings.info.ewma': '用于平滑扫描变化率。数值越高越敏感，数值越低越稳定。',
@@ -218,6 +219,9 @@ export const zhMessages = {
   'settings.preferences.tokenUnits': '本地化 Token 单位',
   'settings.preferences.tokenUnitsHint':
     '根据当前语言显示 Token 缩写单位。关闭后始终使用 K、M、B 等英文单位。',
+  'settings.preferences.unknownModelPricing': '未知模型默认计费',
+  'settings.preferences.unknownModelPricingHint':
+    '开启后，未匹配到模型价格的模型会按内置默认价格估算成本：每百万输入 Token 0.5 美元、每百万输出 Token 2 美元。',
   'settings.feedback.loading': '正在加载设置...',
   'settings.feedback.loadFailed': '加载设置失败。',
   'settings.feedback.saveFailed': '保存设置失败。',

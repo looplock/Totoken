@@ -6,7 +6,9 @@ use tauri::State;
 use super::{ensure_storage_runtime_current, run_blocking};
 use crate::error::{AppError, AppResult};
 use crate::events;
+use crate::pricing::CostEstimationPolicy;
 use crate::scanner::{ScanRequest, ScanSummary, Scanner};
+use crate::settings;
 use crate::source_settings;
 use crate::state::AppState;
 
@@ -44,6 +46,7 @@ pub async fn start_scan(
         .ok_or_else(|| AppError::validation("scan source app is required"))?;
 
     let source_settings_store = state.source_settings_store();
+    let cost_estimation_policy = settings::get_cost_estimation_policy(&app)?;
     let started_root_path =
         format_configured_source_targets(&app, &source_settings_store, &requested_source_app)
             .ok()
@@ -82,6 +85,7 @@ pub async fn start_scan(
             &state.source_settings_store(),
             &requested_source_app_for_scan,
             &trimmed,
+            cost_estimation_policy,
         );
 
         match result {
@@ -155,16 +159,20 @@ fn scan_configured_source_targets(
     source_settings_store: &source_settings::SourceSettingsStore,
     source_app: &str,
     fallback_path: &str,
+    cost_estimation_policy: CostEstimationPolicy,
 ) -> AppResult<ScanSummary> {
     let configured_targets =
         source_settings::list_scannable_sources_for_app(app, source_settings_store, source_app)?;
     if configured_targets.is_empty() {
-        return scanner.scan(ScanRequest {
-            root_path: PathBuf::from(fallback_path),
-            source_app: source_app.to_string(),
-            trigger_type: "manual".to_string(),
-            create_run: true,
-        });
+        return scanner.scan(
+            ScanRequest {
+                root_path: PathBuf::from(fallback_path),
+                source_app: source_app.to_string(),
+                trigger_type: "manual".to_string(),
+                create_run: true,
+            },
+            cost_estimation_policy,
+        );
     }
 
     let run_id = scanner.create_scan_run("manual")?;
@@ -191,12 +199,15 @@ fn scan_configured_source_targets(
                 continue;
             }
 
-            let target_summary = scanner.scan(ScanRequest {
-                root_path: target.path,
-                source_app: source_app.to_string(),
-                trigger_type: "manual".to_string(),
-                create_run: false,
-            })?;
+            let target_summary = scanner.scan(
+                ScanRequest {
+                    root_path: target.path,
+                    source_app: source_app.to_string(),
+                    trigger_type: "manual".to_string(),
+                    create_run: false,
+                },
+                cost_estimation_policy,
+            )?;
             summary.files_seen += target_summary.files_seen;
             summary.files_parsed += target_summary.files_parsed;
             summary.files_skipped += target_summary.files_skipped;

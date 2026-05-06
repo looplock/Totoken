@@ -31,6 +31,9 @@ export type SettingsState = {
     localizedTokenUnits: boolean;
     closeAction: CloseAction;
   };
+  costEstimation: {
+    billUnknownModelsWithDefaultPricing: boolean;
+  };
 };
 
 export type ScanSummary = {
@@ -85,6 +88,9 @@ export function createDefaultSettings(): SettingsState {
       notifications: true,
       localizedTokenUnits: true,
       closeAction: 'quit',
+    },
+    costEstimation: {
+      billUnknownModelsWithDefaultPricing: false,
     },
   };
 }

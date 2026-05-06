@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use app_lib::db::init_db_with_path;
+use app_lib::pricing::CostEstimationPolicy;
 use app_lib::scanner::{ScanRequest, ScanSummary, Scanner};
 use app_lib::source_settings::SourceSettingsState;
 use chrono::{Local, Utc};
@@ -42,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rebuilt_sessions = 0_u64;
     let mut rebuild_errors = 0_u64;
     for session_id in &session_ids {
-        match scanner.ensure_session_message_index(session_id) {
+        match scanner.ensure_session_message_index(session_id, CostEstimationPolicy::default()) {
             Ok(true) => {
                 rebuilt_sessions += 1;
             }
@@ -75,12 +76,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             println!("scan {} {}", OPENCODE_SOURCE_APP, target.path.display());
-            let target_summary = scanner.scan(ScanRequest {
-                root_path: target.path.clone(),
-                source_app: OPENCODE_SOURCE_APP.to_string(),
-                trigger_type: "manual".to_string(),
-                create_run: false,
-            })?;
+            let target_summary = scanner.scan(
+                ScanRequest {
+                    root_path: target.path.clone(),
+                    source_app: OPENCODE_SOURCE_APP.to_string(),
+                    trigger_type: "manual".to_string(),
+                    create_run: false,
+                },
+                CostEstimationPolicy::default(),
+            )?;
             merge_summary(&mut summary, target_summary);
         }
         Ok(())
