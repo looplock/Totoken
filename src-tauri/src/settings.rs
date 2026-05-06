@@ -46,7 +46,7 @@ pub struct UiPreferencesSettings {
     pub close_action: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CostEstimationSettings {
     #[serde(default = "default_false")]
@@ -333,14 +333,6 @@ fn sync_tray_visibility_for_close_action(app: &AppHandle, close_action: &str) {
 
     if let Err(error) = tray.set_visible(close_action == CLOSE_ACTION_TRAY) {
         log::warn!("failed to update system tray visibility: {error}");
-    }
-}
-
-impl Default for CostEstimationSettings {
-    fn default() -> Self {
-        Self {
-            bill_unknown_models_with_default_pricing: false,
-        }
     }
 }
 

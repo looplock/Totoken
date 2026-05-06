@@ -544,6 +544,7 @@ impl Scanner {
         Ok(changed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_normalized_session_with_tx(
         &self,
         tx: &rusqlite::Transaction<'_>,
