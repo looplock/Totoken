@@ -17,4 +17,11 @@
 
 - Git branch create/switch operations may need escalated permission first; request approval before retrying.
 - If PowerShell displays UTF-8 source text as mojibake, verify with a UTF-8 reader before assuming the file is corrupted.
-- run `pnpm format:check` after TS/TSX/i18n edits and format before pushing.
+- Run `pnpm format:check` after TS/TSX/i18n edits and format before pushing.
+- Before pushing a PR branch, run the CI-equivalent local checks from `.github/workflows/ci.yml` when feasible:
+  - `pnpm lint`
+  - `pnpm format:check`
+  - `pnpm build`
+  - `cargo fmt --all -- --check` from `src-tauri/`
+  - `cargo clippy --all-targets --all-features --locked -- -D warnings` from `src-tauri/`
+  - `cargo test --locked` from `src-tauri/`

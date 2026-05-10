@@ -53,6 +53,8 @@ struct CachedSessionIndex {
 #[derive(Debug, Default)]
 struct ParsedCodexSession {
     external_session_id: Option<String>,
+    is_forked_subagent: bool,
+    skipping_fork_replay: bool,
     title: Option<String>,
     model_first: Option<String>,
     model_last: Option<String>,
@@ -72,7 +74,7 @@ impl SourceAdapter for CodexAdapter {
     }
 
     fn parser_version(&self) -> i64 {
-        2
+        3
     }
 
     fn can_handle(&self, path: &Path) -> bool {
@@ -154,16 +156,22 @@ impl ParsedCodexSession {
         timestamp: Option<DateTime<Utc>>,
         line_number: usize,
     ) {
-        self.track_timestamp(timestamp);
-
         match record.get("type").and_then(Value::as_str) {
-            Some("session_meta") => self.consume_session_meta(record),
+            Some("session_meta") => {
+                self.track_timestamp(timestamp);
+                self.consume_session_meta(record);
+            }
+            _ if self.should_skip_fork_replay_record(record) => {}
             Some("turn_context") => self.consume_turn_context(record),
             Some("event_msg") => {
+                self.track_timestamp(timestamp);
                 self.consume_event_message(source_app, record, timestamp, line_number)
             }
-            Some("response_item") => self.consume_response_item(record),
-            _ => {}
+            Some("response_item") => {
+                self.track_timestamp(timestamp);
+                self.consume_response_item(record)
+            }
+            _ => self.track_timestamp(timestamp),
         }
     }
 
@@ -184,7 +192,52 @@ impl ParsedCodexSession {
                 .and_then(parse_rfc3339_utc);
         }
 
+        if self.is_forked_subagent_session(payload) {
+            self.is_forked_subagent = true;
+            self.skipping_fork_replay = true;
+        }
+
         self.capture_model(payload.get("model").and_then(Value::as_str));
+    }
+
+    fn is_forked_subagent_session(&self, payload: &Value) -> bool {
+        payload
+            .get("forked_from_id")
+            .and_then(Value::as_str)
+            .is_some()
+            || payload
+                .get("source")
+                .and_then(|value| value.get("subagent"))
+                .and_then(|value| value.get("thread_spawn"))
+                .is_some()
+    }
+
+    fn should_skip_fork_replay_record(&mut self, record: &Value) -> bool {
+        if !self.is_forked_subagent || !self.skipping_fork_replay {
+            return false;
+        }
+
+        let payload = record.get("payload").unwrap_or(&Value::Null);
+        if record.get("type").and_then(Value::as_str) == Some("event_msg")
+            && payload.get("type").and_then(Value::as_str) == Some("task_started")
+            && self.is_live_fork_task_started(payload)
+        {
+            self.skipping_fork_replay = false;
+            return false;
+        }
+
+        true
+    }
+
+    fn is_live_fork_task_started(&self, payload: &Value) -> bool {
+        let Some(created_at) = self.source_created_at else {
+            return true;
+        };
+        let Some(started_at) = payload.get("started_at").and_then(Value::as_i64) else {
+            return true;
+        };
+
+        started_at >= created_at.timestamp()
     }
 
     fn consume_turn_context(&mut self, record: &Value) {
@@ -826,6 +879,41 @@ mod tests {
         assert_eq!(second_request.input_tokens, Some(26_153));
         assert_eq!(second_request.output_tokens, Some(2_398));
         assert_eq!(second_request.cache_read_input_tokens, Some(21_248));
+    }
+
+    #[test]
+    fn forked_subagent_skips_parent_replay_usage() {
+        let content = r#"{"timestamp":"2026-05-10T07:45:47.977Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","timestamp":"2026-05-10T07:45:47.855Z","model":"gpt-5.5","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}}}}
+{"timestamp":"2026-05-10T07:45:47.981Z","type":"event_msg","payload":{"type":"task_started","turn_id":"parent-turn","started_at":1778390000}}
+{"timestamp":"2026-05-10T07:45:47.982Z","type":"event_msg","payload":{"type":"user_message","message":"parent replay","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-05-10T07:45:47.983Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100000,"cached_input_tokens":90000,"output_tokens":1000},"last_token_usage":{"input_tokens":100000,"cached_input_tokens":90000,"output_tokens":1000}}}}
+{"timestamp":"2026-05-10T07:45:48.093Z","type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1778399148}}
+{"timestamp":"2026-05-10T07:45:48.101Z","type":"event_msg","payload":{"type":"user_message","message":"child work","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-05-10T07:45:48.120Z","type":"event_msg","payload":{"type":"agent_message","message":"child result"}}
+{"timestamp":"2026-05-10T07:45:48.130Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100500,"cached_input_tokens":90400,"output_tokens":1025},"last_token_usage":{"input_tokens":500,"cached_input_tokens":400,"output_tokens":25}}}}"#;
+        let path = write_test_rollout(content);
+
+        let parsed = CodexAdapter::default().parse(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let session = &parsed[0];
+        assert_eq!(
+            session.external_session_id.as_deref(),
+            Some("child-session")
+        );
+        assert_eq!(session.total_input_tokens, 500);
+        assert_eq!(session.total_output_tokens, 25);
+        assert_eq!(session.message_count, 2);
+        assert_eq!(session.requests.len(), 1);
+        assert_eq!(
+            session.requests[0].source_request_id.as_deref(),
+            Some("child-turn")
+        );
+        assert_eq!(session.requests[0].input_tokens, Some(500));
+        assert_eq!(session.requests[0].output_tokens, Some(25));
+        assert_eq!(session.requests[0].cache_read_input_tokens, Some(400));
+        assert_eq!(session.events.len(), 1);
+        assert_eq!(session.events[0].delta_input, 500);
     }
 
     #[test]
